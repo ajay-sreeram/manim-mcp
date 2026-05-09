@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import builtins
 import html
 import importlib.metadata
 import json
@@ -382,6 +383,148 @@ def analyze_code_safety(code: str) -> list[str]:
     return visitor.violations
 
 
+def _bound_names_from_target(target: ast.AST) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for element in target.elts:
+            names.update(_bound_names_from_target(element))
+        return names
+    return set()
+
+
+def _module_bound_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set(dir(builtins))
+    names.update(RESERVED_NARRATION_HELPER_NAMES)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "manim" and any(alias.name == "*" for alias in node.names):
+                names.add("__manim_star__")
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.update(_bound_names_from_target(target))
+        elif isinstance(node, ast.AnnAssign):
+            names.update(_bound_names_from_target(node.target))
+    return names
+
+
+class ConstructNameValidator(ast.NodeVisitor):
+    """Catch a small class of generated-code NameErrors before rendering."""
+
+    def __init__(self, initial_names: set[str]) -> None:
+        self.defined = set(initial_names)
+        self.violations: list[str] = []
+        self._expired_comprehension_targets: set[str] = set()
+        self._reported: set[tuple[int, str]] = set()
+
+    def _report(self, node: ast.AST, name: str, message: str) -> None:
+        line = getattr(node, "lineno", 0) or 0
+        key = (line, name)
+        if key in self._reported:
+            return
+        self._reported.add(key)
+        self.violations.append(f"line {line}: {message}")
+
+    def _bind_target(self, target: ast.AST) -> None:
+        self.defined.update(_bound_names_from_target(target))
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if not isinstance(node.ctx, ast.Load):
+            return
+        if node.id in self.defined:
+            return
+        if node.id in self._expired_comprehension_targets:
+            self._report(
+                node,
+                node.id,
+                (
+                    f"name '{node.id}' is not defined outside the comprehension that used it; "
+                    "assign from an explicit list element or loop over the list instead"
+                ),
+            )
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.defined.add(node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.defined.add(node.name)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.defined.add(node.name)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self._bind_target(target)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self.visit(node.value)
+        self._bind_target(node.target)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.visit(node.target)
+        self.visit(node.value)
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.iter)
+        self._bind_target(node.target)
+        for statement in node.body:
+            self.visit(statement)
+        for statement in node.orelse:
+            self.visit(statement)
+
+    def _visit_comprehension(self, generators: list[ast.comprehension], value_nodes: list[ast.AST]) -> None:
+        saved_defined = set(self.defined)
+        local_targets: set[str] = set()
+        for generator in generators:
+            self.visit(generator.iter)
+            target_names = _bound_names_from_target(generator.target)
+            self.defined.update(target_names)
+            local_targets.update(target_names)
+            for condition in generator.ifs:
+                self.visit(condition)
+        for value_node in value_nodes:
+            self.visit(value_node)
+        self.defined = saved_defined
+        self._expired_comprehension_targets.update(local_targets)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node.generators, [node.key, node.value])
+
+
+def analyze_code_validation(code: str, scene_name: str) -> list[str]:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    construct = _target_construct_function(tree, scene_name)
+    if construct is None:
+        return []
+    validator = ConstructNameValidator({*_module_bound_names(tree), "self"})
+    for statement in construct.body:
+        validator.visit(statement)
+    return validator.violations
+
+
 def _root_name(node: ast.AST) -> str | None:
     current = node
     while isinstance(current, ast.Attribute):
@@ -498,6 +641,27 @@ def _tail(text: str | bytes | None, max_chars: int = 6000) -> str:
     if isinstance(text, bytes):
         text = text.decode("utf-8", errors="replace")
     return text[-max_chars:]
+
+
+def extract_render_error_summary(stderr: str | bytes | None) -> str | None:
+    """Pull the useful exception line out of Manim/Rich traceback output."""
+    text = _tail(stderr, max_chars=20_000)
+    if not text.strip():
+        return None
+    error_pattern = re.compile(r"^(?:[A-Za-z_][\w.]*Error|Exception): .+")
+    for raw_line in reversed(text.splitlines()):
+        line = raw_line.strip()
+        if error_pattern.match(line):
+            return line[:500]
+    for raw_line in reversed(text.splitlines()):
+        line = raw_line.strip(" │╭╮╰╯─")
+        if error_pattern.match(line):
+            return line[:500]
+    for raw_line in reversed(text.splitlines()):
+        line = raw_line.strip()
+        if line:
+            return line[:500]
+    return None
 
 
 def _write_text(path: Path, content: str | bytes | None) -> None:
@@ -1318,14 +1482,24 @@ class NarrationTimeline:
         self.plan = plan or NARRATION_TIMING
 
     def segment(self, index):
-        return self.plan["segments"][index]
+        try:
+            index = int(index)
+        except Exception:
+            return dict(index=index, text="", duration_seconds=0.05, out_of_range=True)
+        segments = self.plan.get("segments", [])
+        if 0 <= index < len(segments):
+            return segments[index]
+        return dict(index=index, text="", duration_seconds=0.05, out_of_range=True)
 
     def duration(self, index, *, minimum=0.05):
         return max(minimum, float(self.segment(index)["duration_seconds"]))
 
     def play_segment(self, index, *animations, hold=0.0, **kwargs):
         run_time = max(0.05, self.duration(index) - max(0.0, hold))
-        self.scene.play(*animations, run_time=run_time, **kwargs)
+        if animations:
+            self.scene.play(*animations, run_time=run_time, **kwargs)
+        else:
+            self.scene.wait(run_time)
         if hold > 0:
             self.scene.wait(hold)
 
@@ -1446,12 +1620,16 @@ def prepare_narrated_scene_code(
         covered_indices = sorted(
             index for index in timeline_usage.segment_indices if 0 <= index < segment_count
         )
+        out_of_range_indices = sorted(
+            index for index in timeline_usage.segment_indices if index < 0 or index >= segment_count
+        )
         missing_indices = [
             index for index in range(segment_count) if index not in timeline_usage.segment_indices
         ]
         report["explicit_timeline_segment_count"] = segment_count
         report["explicit_timeline_segment_call_count"] = timeline_usage.segment_call_count
         report["explicit_timeline_segment_indices"] = covered_indices
+        report["explicit_timeline_out_of_range_segments"] = out_of_range_indices
         report["explicit_timeline_covered_segment_count"] = len(set(covered_indices))
         report["explicit_timeline_missing_segments"] = missing_indices
         report["explicit_timeline_dynamic_segment_call_count"] = timeline_usage.dynamic_segment_call_count
@@ -2297,6 +2475,7 @@ def analyze_render_quality(metadata: dict[str, Any], *, visual_checks: bool = Tr
             segment_count = int(narration_sync.get("explicit_timeline_segment_count") or 0)
             covered_count = int(narration_sync.get("explicit_timeline_covered_segment_count") or 0)
             missing_segments = narration_sync.get("explicit_timeline_missing_segments") or []
+            out_of_range_segments = narration_sync.get("explicit_timeline_out_of_range_segments") or []
             dynamic_segment_calls = int(
                 narration_sync.get("explicit_timeline_dynamic_segment_call_count") or 0
             )
@@ -2314,6 +2493,20 @@ def analyze_render_quality(metadata: dict[str, Any], *, visual_checks: bool = Tr
                         "covered_segment_count": covered_count,
                         "segment_count": segment_count,
                         "missing_segments": missing_segments,
+                    }
+                )
+            if out_of_range_segments:
+                issues.append(
+                    {
+                        "severity": "warning",
+                        "code": "out_of_range_timeline_segment",
+                        "message": (
+                            "Some timeline calls use segment indices outside the narration range. "
+                            "Extra timeline waits are treated as short pauses; bind narration only "
+                            "to indices 0 through segment_count - 1."
+                        ),
+                        "segment_count": segment_count,
+                        "out_of_range_segments": out_of_range_segments,
                     }
                 )
 
@@ -2604,10 +2797,6 @@ def _render_access_lines(access: dict[str, Any]) -> list[str]:
         lines.append(f"Open player: {access['preview_stream_url']}")
     if access.get("video_path"):
         lines.append(f"Video path: {access['video_path']}")
-    if access.get("video_file_uri"):
-        lines.append(f"Video file URI: {access['video_file_uri']}")
-    if access.get("ui_uri"):
-        lines.append(f"Inline UI: {access['ui_uri']}")
     return lines
 
 
@@ -2629,8 +2818,7 @@ def update_final_response_metadata(
     metadata["final_response_markdown"] = final_response
     metadata["claude_response_instructions"] = (
         "Include final_response_markdown verbatim in the next assistant message. "
-        "Do not say only that the render is ready; the user needs the Open video, "
-        "Open player, and Video path lines."
+        "Do not say only that the render is ready; the user needs the access lines."
     )
     return final_response
 
@@ -2771,7 +2959,7 @@ def _render_scene_tool_result(
     metadata: dict[str, Any],
     *,
     include_resource_links: bool = True,
-    include_ui_resource: bool = True,
+    include_ui_resource: bool = False,
     embed_preview_html: bool = False,
     embed_video_bytes: bool = False,
     max_inline_video_bytes: int = 2_000_000,
@@ -2803,10 +2991,6 @@ def _render_scene_tool_result(
             f"Rendered `{metadata.get('scene_name')}` successfully.",
             f"Job ID: `{metadata.get('job_id')}`",
         ]
-        if primary:
-            summary_lines.append(f"Video file: {primary['uri']}")
-        if preview:
-            summary_lines.append(f"HTML preview: {preview['uri']}")
         if narration:
             video = narration.get("video", {})
             duration = video.get("output_duration_seconds") or video.get("audio_duration_seconds")
@@ -2855,19 +3039,6 @@ def _render_scene_tool_result(
                     description="Final Manim render artifact.",
                     mimeType=primary.get("mime_type", "application/octet-stream"),
                     size=primary.get("size_bytes"),
-                )
-            )
-
-        if include_resource_links and preview:
-            content.append(
-                ResourceLink(
-                    type="resource_link",
-                    name="preview.html",
-                    title=f"{metadata.get('scene_name')} HTML preview",
-                    uri=preview["uri"],
-                    description="HTML preview with a video player.",
-                    mimeType="text/html",
-                    size=preview.get("size_bytes"),
                 )
             )
 
@@ -3002,6 +3173,14 @@ def _render_scene_metadata(
             }
 
         resolved_scene_name = infer_scene_name(code, scene_name)
+        validation_violations = analyze_code_validation(code, resolved_scene_name)
+        if validation_violations:
+            return {
+                "success": False,
+                "blocked": False,
+                "error": "Scene code failed validation preflight checks.",
+                "violations": validation_violations,
+            }
     except Exception as exc:
         return {
             "success": False,
@@ -3137,6 +3316,7 @@ def _render_scene_metadata(
         _write_text(stdout_path, completed.stdout)
         _write_text(stderr_path, completed.stderr)
         artifacts = discover_artifacts(media_dir)
+        stderr_tail = _tail(completed.stderr)
         metadata.update(
             {
                 "success": completed.returncode == 0 and bool(artifacts),
@@ -3144,11 +3324,16 @@ def _render_scene_metadata(
                 "duration_seconds": round(time.monotonic() - started, 3),
                 "artifacts": artifacts,
                 "stdout_tail": _tail(completed.stdout),
-                "stderr_tail": _tail(completed.stderr),
+                "stderr_tail": stderr_tail,
             }
         )
         if completed.returncode != 0:
-            metadata["error"] = "Manim exited with a non-zero status."
+            summary = extract_render_error_summary(stderr_tail)
+            if summary:
+                metadata["render_error_summary"] = summary
+                metadata["error"] = f"Manim failed: {summary}"
+            else:
+                metadata["error"] = "Manim exited with a non-zero status."
         elif not artifacts:
             metadata["error"] = "Manim completed but no output artifact was discovered."
     except subprocess.TimeoutExpired as exc:
@@ -3238,24 +3423,21 @@ def plan_narration_timing(
 def write_narrated_manim_scene_prompt(topic: str, quality: str = "low") -> str:
     """Prompt template for synchronized narrated Manim scenes."""
     return f"""
-Create and render a narrated Manim Community Edition scene about: {topic}
+Create and render a narrated ManimCE scene about: {topic}
 
-Use the manim MCP tool render_scene_with_narration with quality="{quality}",
+Use render_scene_with_narration with quality="{quality}",
 narration_sync_mode="timeline", narration_audio_mode="segmented",
 visual_quality_checks=true, and fail_on_quality_issues=true.
 
 Rules:
-- Write narration_text first: 7 to 12 short sentences, one visual beat each.
-- Segment 0 introduces the topic/problem, segment 1 states the goal, middle segments explain step by step, final segment summarizes.
-- Do not jump straight to the final answer or finished diagram; show the setup first.
-- In construct(), call tl = narration_timeline(self), then bind every sentence once, in order, with tl.play_segment(index, ...) or tl.wait_segment(index).
-- Do not define or override narration_timeline, NarrationTimeline, fit_to_safe_frame, or keep_in_safe_frame.
-- Do not rely on automatic retiming; avoid timed self.play/self.wait outside tl and use self.add(...) only for instant setup.
-- Keep each beat simple: one focal motion and at most one active callout; fade or replace old labels before adding new ones.
-- For orbits, graphs, maps, networks, and other wide layouts, group the system and call fit_to_safe_frame(group); keep labels/callouts inside frame with keep_in_safe_frame(...).
-- Prefer Text unless LaTeX is required; use Tex/MathTex only when tex_ready=true.
-- If the first render fails a sync/layout quality gate, revise once and rerender.
-- Do not mention internal sync warnings after a successful final render; include final_response_markdown verbatim so the user sees Open video, Open player, and Video path.
+- Use ManimCE normally; the MCP helpers are for timing/framing, not a replacement for Manim.
+- Write narration_text first: 6 to 10 short sentences. Sentence 0 introduces the topic/problem, sentence 1 states the goal, middle sentences explain step by step, final sentence summarizes.
+- In construct(), use tl = narration_timeline(self), then bind each sentence once with tl.play_segment(index, ...) or tl.wait_segment(index). For N sentences, valid indices are 0 through N-1.
+- Keep timed self.play/self.wait calls inside tl segments; use self.add(...) for instant setup.
+- Use fit_to_safe_frame(group) for wide layouts and keep_in_safe_frame(label) for floating labels/callouts.
+- Avoid common Python mistakes: do not reuse comprehension variables like i or p after a comprehension.
+- Prefer Text unless LaTeX is really needed and tex_ready=true.
+- If rendering fails, fix the reported diagnostic and rerender once. On success, include final_response_markdown verbatim.
 """.strip()
 
 
@@ -3277,19 +3459,19 @@ def render_scene(
     visual_quality_checks: bool = True,
     fail_on_quality_issues: bool = False,
     include_resource_links: bool = True,
-    include_ui_resource: bool = True,
+    include_ui_resource: bool = False,
     embed_preview_html: bool = False,
     embed_video_bytes: bool = False,
     max_inline_video_bytes: int = 2_000_000,
     max_inline_ui_video_bytes: int = 0,
 ) -> CallToolResult:
-    """Render a complete ManimCE scene and return media links, preview HTML, and metadata.
+    """Render a complete ManimCE scene and return compact media links and metadata.
 
-    Media bytes and the secondary preview HTML are not embedded by default so the
-    MCP tool result stays below Claude Desktop's response size limits. The
-    ui:// HTML resource loads media from a local artifact URL. Set
-    max_inline_ui_video_bytes or embed_video_bytes only for very small files if
-    your client supports embedded binary resources.
+    Media bytes, preview HTML, and ui:// resources are not embedded by default
+    so the MCP tool result stays below Claude Desktop's response size limits.
+    The normal response includes Open video, Open player, and Video path lines.
+    Set include_ui_resource, embed_preview_html, or embed_video_bytes only when
+    your MCP client can render those resources usefully.
 
     Args:
         narration_text: Optional narration to synthesize through Hugging Face
@@ -3313,7 +3495,7 @@ def render_scene(
 
     Important for Claude Desktop: after this tool returns, include
     `final_response_markdown` verbatim in the assistant response. It contains
-    the Open video, Open player, and Video path lines the user needs.
+    the access lines the user needs.
     """
     metadata = _render_scene_metadata(
         code=code,
@@ -3359,7 +3541,7 @@ def render_scene_with_narration(
     visual_quality_checks: bool = True,
     fail_on_quality_issues: bool = True,
     include_resource_links: bool = True,
-    include_ui_resource: bool = True,
+    include_ui_resource: bool = False,
     embed_preview_html: bool = False,
     embed_video_bytes: bool = False,
     max_inline_video_bytes: int = 2_000_000,
@@ -3387,10 +3569,12 @@ def render_scene_with_narration(
     Use explicit timeline beats by default: call `tl = narration_timeline(self)`
     near the start of construct(), then bind every narration sentence in order
     with exactly one primary `tl.play_segment(index, ...)` or
-    `tl.wait_segment(index)`. Avoid timed self.play/self.wait outside the helper
+    `tl.wait_segment(index)`. If there are N narration sentences, use only
+    indices 0 through N-1. Avoid timed self.play/self.wait outside the helper
     except for instant setup via self.add(...). The automatic retimer can count
     literal range/list loops and simple local list/tuple/set assignments, but
-    complex loops should use explicit segment calls.
+    complex loops should use explicit segment calls. Do not reuse comprehension
+    variables such as `i` or `p` after the comprehension ends.
     Do not define custom helpers named `narration_timeline`,
     `NarrationTimeline`, `fit_to_safe_frame`, or `keep_in_safe_frame`; the
     server injects those.
@@ -3402,8 +3586,9 @@ def render_scene_with_narration(
     before animating them; keep labels within the frame with keep_in_safe_frame.
     By default, severe sync drift or clipped-frame quality checks return a tool
     error with artifact links so Claude can inspect, revise, and rerender once
-    before responding to the user. If the final render succeeds, do not mention
-    internal sync warnings in the final response.
+    before responding to the user. If Manim exits with an exception, the tool
+    returns the concise exception line so Claude can fix the scene. If the final
+    render succeeds, do not mention internal sync warnings in the final response.
     After this tool returns, include `final_response_markdown` verbatim in the
     assistant response so the user can open the video from Claude Desktop.
     HF_TOKEN is optional; without it, local Kokoro TTS is used.

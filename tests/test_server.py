@@ -74,6 +74,38 @@ class Demo(Scene):
     assert violations == []
 
 
+def test_validation_flags_stale_comprehension_variable() -> None:
+    violations = server.analyze_code_validation(
+        """
+from manim import *
+import numpy as np
+
+class Demo(Scene):
+    def construct(self):
+        points = [np.array([x, 0, 0]) for x in [1, 2]]
+        dots = [Dot(p) for p in points]
+        extra = Dot(p)
+""",
+        "Demo",
+    )
+
+    assert violations == [
+        "line 9: name 'p' is not defined outside the comprehension that used it; "
+        "assign from an explicit list element or loop over the list instead"
+    ]
+
+
+def test_extract_render_error_summary_from_manim_traceback() -> None:
+    stderr = """
+╭───────────────────── Traceback (most recent call last) ──────────────────────╮
+│ /tmp/scene.py:12 in construct                                                │
+╰──────────────────────────────────────────────────────────────────────────────╯
+NameError: name 'p' is not defined
+"""
+
+    assert server.extract_render_error_summary(stderr) == "NameError: name 'p' is not defined"
+
+
 def test_build_manim_command_uses_fixed_media_and_log_dirs(tmp_path) -> None:
     command = server.build_manim_command(
         script_path=tmp_path / "scene.py",
@@ -419,6 +451,55 @@ class Demo(Scene):
     assert "NARRATION_TIMING" in code
 
 
+def test_prepare_narrated_scene_code_reports_out_of_range_timeline_segments() -> None:
+    code, report = server.prepare_narrated_scene_code(
+        """
+from manim import *
+
+class Demo(Scene):
+    def construct(self):
+        tl = narration_timeline(self)
+        tl.play_segment(0, FadeIn(Square()))
+        tl.wait_segment(1)
+""",
+        scene_name="Demo",
+        timing_plan={"segments": [{"duration_seconds": 1.0}]},
+        sync_mode="timeline",
+    )
+
+    assert report["explicit_timeline_segment_indices"] == [0]
+    assert report["explicit_timeline_out_of_range_segments"] == [1]
+    assert 'return dict(index=index, text="", duration_seconds=0.05, out_of_range=True)' in code
+
+
+def test_narration_timeline_helper_treats_extra_segment_as_short_pause() -> None:
+    namespace = {
+        "config": type("Config", (), {"frame_width": 14.2, "frame_height": 8.0})(),
+        "RIGHT": 1,
+        "LEFT": 1,
+        "UP": 1,
+        "DOWN": 1,
+    }
+    exec(
+        server.narration_timing_helper_source(
+            {"segments": [{"duration_seconds": 1.0}]},
+        ),
+        namespace,
+    )
+
+    class FakeScene:
+        waits = []
+
+        def wait(self, duration):
+            self.waits.append(duration)
+
+    fake_scene = FakeScene()
+    timeline = namespace["narration_timeline"](fake_scene)
+    timeline.wait_segment(1)
+
+    assert fake_scene.waits == [0.05]
+
+
 def test_prepare_narrated_scene_code_protects_injected_timeline_helper() -> None:
     code, report = server.prepare_narrated_scene_code(
         """
@@ -483,9 +564,9 @@ def test_write_narrated_manim_scene_prompt_guides_sync_and_frame_safety() -> Non
     assert "final_response_markdown" in prompt
     assert "introduces the topic/problem" in prompt
     assert "step by step" in prompt
-    assert "Do not jump straight" in prompt
-    assert "Do not rely on automatic retiming" in prompt
-    assert "Do not mention internal sync warnings" in prompt
+    assert "Use ManimCE normally" in prompt
+    assert "Avoid common Python mistakes" in prompt
+    assert "fix the reported diagnostic" in prompt
 
 
 def test_synthesize_narration_audio_uses_local_kokoro_without_hf_token(tmp_path, monkeypatch) -> None:
@@ -865,6 +946,26 @@ def test_analyze_render_quality_flags_timeline_duration_mismatch() -> None:
     assert quality["issues"][0]["code"] == "severe_timeline_duration_mismatch"
 
 
+def test_analyze_render_quality_warns_for_out_of_range_timeline_segment() -> None:
+    metadata = {
+        "success": True,
+        "narration_requested": True,
+        "narration_sync": {
+            "explicit_timeline_used": True,
+            "explicit_timeline_segment_count": 1,
+            "explicit_timeline_covered_segment_count": 1,
+            "explicit_timeline_out_of_range_segments": [1],
+        },
+        "artifacts": [],
+    }
+
+    quality = server.analyze_render_quality(metadata)
+
+    assert quality["ok"] is True
+    assert quality["issues"][0]["severity"] == "warning"
+    assert quality["issues"][0]["code"] == "out_of_range_timeline_segment"
+
+
 def test_analyze_render_quality_flags_frame_edge_contact(tmp_path, monkeypatch) -> None:
     video = tmp_path / "Demo.mp4"
     video.write_bytes(b"video")
@@ -1067,20 +1168,14 @@ def test_render_scene_tool_result_includes_resource_links(tmp_path) -> None:
     result = server._render_scene_tool_result(metadata)
 
     assert result.isError is False
-    assert result.structuredContent["ui_preview"]["uri"] == "ui://manim/render/20260505T000000Z-deadbeef"
-    assert result.structuredContent["ui_preview"]["inline_media"] is False
     assert result.structuredContent["preview_html"]["mime_type"] == "text/html"
-    ui_resources = [
-        item for item in result.content
-        if item.type == "resource" and item.resource.mimeType == "text/html;profile=mcp-app"
-    ]
-    assert len(ui_resources) == 1
-    assert str(ui_resources[0].resource.uri) == "ui://manim/render/20260505T000000Z-deadbeef"
-    assert "data:video/mp4;base64," not in ui_resources[0].resource.text
-    assert output.resolve().as_uri() in ui_resources[0].resource.text
-    assert "<video id=\"render\" controls" in ui_resources[0].resource.text
+    assert "ui_preview" not in result.structuredContent
+    assert not any(item.type == "resource" for item in result.content)
     assert any(item.type == "resource_link" and item.mimeType == "video/mp4" for item in result.content)
-    assert any(item.type == "resource_link" and item.mimeType == "text/html" for item in result.content)
+    assert not any(
+        item.type == "resource_link" and str(item.uri).endswith("/preview.html")
+        for item in result.content
+    )
 
 
 def test_render_scene_tool_result_can_inline_tiny_ui_media_when_requested(tmp_path) -> None:
@@ -1098,7 +1193,11 @@ def test_render_scene_tool_result_can_inline_tiny_ui_media_when_requested(tmp_pa
     }
     server.create_preview_html(metadata)
 
-    result = server._render_scene_tool_result(metadata, max_inline_ui_video_bytes=10)
+    result = server._render_scene_tool_result(
+        metadata,
+        include_ui_resource=True,
+        max_inline_ui_video_bytes=10,
+    )
 
     assert result.structuredContent["ui_preview"]["inline_media"] is True
     ui_resource = next(
@@ -1134,6 +1233,8 @@ def test_render_scene_tool_result_surfaces_app_video_links(tmp_path, monkeypatch
     assert f"Open video: {access['video_stream_url']}" in text
     assert f"Open player: {access['preview_stream_url']}" in text
     assert f"Video path: {output.resolve()}" in text
+    assert "HTML preview:" not in text
+    assert "Video file URI:" not in text
     assert result.structuredContent["final_response_markdown"] in text
     assert "claude_response_instructions" in result.structuredContent
     assert any(

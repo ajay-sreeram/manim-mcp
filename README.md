@@ -6,8 +6,8 @@ Local MCP server for Claude Desktop that renders Manim Community Edition scenes 
 
 - `check_environment`: reports Python, optional `uv`, MCP SDK, Manim, FFmpeg, `pkg-config`, Cairo, LaTeX, and TTS availability. It is a diagnostic tool only; it does not install anything.
 - `render_scene`: renders one Manim scene from complete ManimCE Python code into a per-job folder under `renders/`.
-  Successful renders return compact inline HTML as a `ui://manim/render/<job_id>` resource with MIME `text/html;profile=mcp-app`. The HTML contains a `<video controls>` element that streams the local render artifact from a read-only `127.0.0.1` URL when possible, keeping the MCP tool result under Claude Desktop's size limit. The visible tool text also includes `Open video`, `Open player`, and `Video path` lines so the result is easy to access even if Claude hides resource cards.
-  Pass `narration_text` to synthesize narration with hosted Hugging Face TTS or local Kokoro, save it as audio, and mux it into the rendered MP4 before the inline preview is produced.
+  Successful renders return compact `Open video`, `Open player`, and `Video path` lines plus metadata. Media bytes and HTML resources are not embedded by default, keeping Claude Desktop tool results small and predictable.
+  Pass `narration_text` to synthesize narration with hosted Hugging Face TTS or local Kokoro, save it as audio, and mux it into the rendered MP4.
 - `render_scene_with_narration`: same renderer, but with required `narration_text`. Use this when you ask Claude for voice, narration, audio, or a spoken explanation. By default it synthesizes one TTS file per narration segment, measures each segment's real duration, concatenates the audio, retimes ordinary `self.play(...)` and `self.wait(...)` calls before rendering, globally fits any small remaining duration mismatch, and verifies that the final MP4 has an audio stream. If `HF_TOKEN` is available, narration uses the hosted Hugging Face Inference API; otherwise it falls back to local Kokoro.
 - `plan_narration_timing`: returns a draft sentence-level timing plan without rendering, useful when writing a scene that explicitly uses the injected `narration_timeline(self)` helper. Final segmented renders replace heuristic durations with measured TTS durations.
 - `get_render_access`: returns only the compact access block for a render job, useful when Claude says a video is ready but does not show the video links. Use `job_id="latest"` for the newest render.
@@ -101,7 +101,7 @@ class Example(Scene):
         tl.wait_segment(2)
 ```
 
-Use `self.add(...)` for instant setup if needed, but avoid timed `self.play(...)` and `self.wait(...)` outside `tl.play_segment(...)` / `tl.wait_segment(...)` in narrated scenes. Do not define custom helpers named `narration_timeline`, `NarrationTimeline`, `fit_to_safe_frame`, or `keep_in_safe_frame`; the server injects them. Automatic timeline mode also understands simple static loops, including literal `range(...)` loops and loops over locally assigned list/tuple/set literals. It rewrites those animations to consume measured per-segment durations at runtime when no explicit timeline helper is used. Loops over dynamic mobjects, comprehensions, external data, or objects built by function calls cannot be reliably counted, so narrated scenes should use explicit segment indices for those cases.
+Use `self.add(...)` for instant setup if needed, but avoid timed `self.play(...)` and `self.wait(...)` outside `tl.play_segment(...)` / `tl.wait_segment(...)` in narrated scenes. If there are N narration sentences, valid segment indices are `0` through `N - 1`. Do not define custom helpers named `narration_timeline`, `NarrationTimeline`, `fit_to_safe_frame`, or `keep_in_safe_frame`; the server injects them. Automatic timeline mode also understands simple static loops, including literal `range(...)` loops and loops over locally assigned list/tuple/set literals. It rewrites those animations to consume measured per-segment durations at runtime when no explicit timeline helper is used. Loops over dynamic mobjects, comprehensions, external data, or objects built by function calls cannot be reliably counted, so narrated scenes should use explicit segment indices for those cases.
 
 ## Quality Gates
 
@@ -114,6 +114,7 @@ The current checks flag:
 - Severe explicit-timeline duration mismatch, where a supposedly segment-bound scene still differs from narration by more than 15 percent.
 - Visual content touching the sampled video frame edge, which usually means labels, orbits, graphs, or panels are clipped.
 - Explicit timeline scenes that do not bind every narration sentence with `tl.play_segment(...)` or `tl.wait_segment(...)`.
+- Out-of-range timeline indices, as warnings. Extra out-of-range waits become short pauses instead of crashing Manim.
 
 When a layout is wide, such as a solar system, graph, map, or timeline, build the full visual as a `VGroup` and call:
 
@@ -193,7 +194,7 @@ Use the manim MCP server tool render_scene_with_narration to render a low qualit
 
 For more complex narrated scenes, use the MCP prompt `write_narrated_manim_scene`. It tells Claude to write the narration first, introduce the topic/problem before solving, bind each sentence to `tl.play_segment(...)` or `tl.wait_segment(...)`, and use `fit_to_safe_frame(...)` for large layouts.
 
-Claude Desktop support for video depends on its MCP Apps/UI renderer. This server returns an embedded `ui://` HTML resource first, so compatible hosts can render the player directly inside the app. The HTML uses a localhost URL for render media instead of embedding large base64 payloads. If the host does not render MCP UI resources inline, use the returned direct MP4 or `preview.html` link.
+Claude Desktop currently surfaces the returned links more reliably than inline MCP UI resources. By default this server does not embed `ui://` HTML or media bytes. It still creates a small local player page for the `Open player` link, but it does not show a separate redundant `preview.html` link in normal responses.
 
 Every successful render now includes these visible access lines in the text result:
 
@@ -203,6 +204,6 @@ Every successful render now includes these visible access lines in the text resu
 
 The result metadata also includes `final_response_markdown` and `claude_response_instructions`. Claude should paste `final_response_markdown` into its chat response. If it forgets, ask Claude to call `get_render_access` with `job_id="latest"`.
 
-By default, video bytes are not base64-embedded in tool responses because Claude Desktop rejects tool results larger than 1MB. For tiny media files, you can opt in by passing `max_inline_ui_video_bytes`, but local-file video URLs are the safer default.
+By default, video bytes are not base64-embedded in tool responses because Claude Desktop rejects tool results larger than 1MB. For compatible MCP clients, you can opt in to `ui://` HTML resources with `include_ui_resource=true`, but local video/player links are the safer default.
 
 If a rendered MP4 is silent, check its `metadata.json`. `narration_requested: false` means Claude called the plain render tool without narration text. Use `render_scene_with_narration` or explicitly pass `narration_text`. `narration_tts_backend` shows whether a render used `huggingface-api` or `local-kokoro`.
