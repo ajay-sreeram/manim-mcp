@@ -79,6 +79,16 @@ LOCAL_NARRATION_PROVIDER = "local-kokoro"
 DEFAULT_LOCAL_NARRATION_VOICE = "af_heart"
 DEFAULT_LOCAL_NARRATION_LANG_CODE = "a"
 LOCAL_NARRATION_PROVIDERS = {"local", "local-kokoro", "kokoro"}
+RESERVED_NARRATION_HELPER_NAMES = {
+    "NARRATION_TIMING",
+    "MANIM_MCP_CALL_DURATIONS",
+    "MANIM_MCP_CALL_DURATION_INDEX",
+    "NarrationTimeline",
+    "_manim_mcp_next_duration",
+    "fit_to_safe_frame",
+    "keep_in_safe_frame",
+    "narration_timeline",
+}
 ASSET_ROUTE_PREFIX = "/render-assets"
 ASSET_ROUTE_TOKEN = secrets.token_urlsafe(18)
 _ASSET_SERVER: ThreadingHTTPServer | None = None
@@ -289,6 +299,7 @@ def check_environment() -> dict[str, Any]:
         },
         "manim_cli": _run_probe([sys.executable, "-m", "manim", "--version"], timeout=30),
         "ffmpeg": _run_probe(["ffmpeg", "-version"]),
+        "ffprobe": _run_probe(["ffprobe", "-version"]),
         "pkg_config": _run_probe(["pkg-config", "--version"]),
         "cairo_pkg_config": _run_probe(["pkg-config", "--exists", "cairo"]),
         "cairo_trace": _run_probe(["cairo-trace", "--version"]),
@@ -297,7 +308,7 @@ def check_environment() -> dict[str, Any]:
         "dvisvgm": _run_probe(["dvisvgm", "--version"]),
     }
     required = ["python", "mcp_sdk", "manim_package", "manim_cli"]
-    recommended = ["ffmpeg", "pkg_config", "cairo_pkg_config"]
+    recommended = ["ffmpeg", "ffprobe", "pkg_config", "cairo_pkg_config"]
     missing_required = [name for name in required if not checks[name].get("available")]
     missing_recommended = [name for name in recommended if not checks[name].get("available")]
     notes = []
@@ -305,6 +316,8 @@ def check_environment() -> dict[str, Any]:
         notes.append("uv is optional for installed packages, but useful for source checkout workflows.")
     if missing_recommended:
         notes.append("Missing native tools may prevent Manim install or video rendering on macOS.")
+    if not checks["ffprobe"].get("available"):
+        notes.append("ffprobe is required for reliable narration/video duration sync.")
     tex_compiler_available = checks["latex"].get("available") or checks["pdflatex"].get("available")
     tex_ready = tex_compiler_available and checks["dvisvgm"].get("available")
     if not tex_ready:
@@ -1002,6 +1015,9 @@ class _TimedCallTransformer(ast.NodeTransformer):
 class _NarrationTimelineUsageVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.call_count = 0
+        self.segment_call_count = 0
+        self.segment_indices: set[int] = set()
+        self.dynamic_segment_call_count = 0
 
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name) and node.func.id == "narration_timeline":
@@ -1013,7 +1029,180 @@ class _NarrationTimelineUsageVisitor(ast.NodeVisitor):
             "segment",
         }:
             self.call_count += 1
+            if node.func.attr in {"play_segment", "wait_segment"}:
+                self.segment_call_count += 1
+                if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, int):
+                    self.segment_indices.add(node.args[0].value)
+                else:
+                    self.dynamic_segment_call_count += 1
         self.generic_visit(node)
+
+
+def _reserved_user_name(name: str) -> str:
+    return f"_manim_mcp_user_{name}"
+
+
+def _rename_reserved_binding(name: str, *, kind: str, line: int | None) -> dict[str, Any] | None:
+    if name not in RESERVED_NARRATION_HELPER_NAMES:
+        return None
+    return {
+        "kind": kind,
+        "line": line,
+        "from": name,
+        "to": _reserved_user_name(name),
+    }
+
+
+def _rename_reserved_targets(target: ast.AST, *, kind: str, line: int | None) -> list[dict[str, Any]]:
+    renames: list[dict[str, Any]] = []
+    if isinstance(target, ast.Name):
+        rename = _rename_reserved_binding(target.id, kind=kind, line=line)
+        if rename:
+            target.id = rename["to"]
+            renames.append(rename)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            renames.extend(_rename_reserved_targets(element, kind=kind, line=line))
+    return renames
+
+
+def sanitize_reserved_narration_names(tree: ast.Module) -> list[dict[str, Any]]:
+    """Rename top-level user bindings that would shadow injected narration helpers."""
+    renames: list[dict[str, Any]] = []
+    for node in tree.body:
+        line = getattr(node, "lineno", None)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            rename = _rename_reserved_binding(node.name, kind=type(node).__name__, line=line)
+            if rename:
+                node.name = rename["to"]
+                renames.append(rename)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                renames.extend(_rename_reserved_targets(target, kind="Assign", line=line))
+        elif isinstance(node, ast.AnnAssign):
+            renames.extend(_rename_reserved_targets(node.target, kind="AnnAssign", line=line))
+        elif isinstance(node, ast.AugAssign):
+            renames.extend(_rename_reserved_targets(node.target, kind="AugAssign", line=line))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                bound_name = alias.asname or alias.name.split(".", 1)[0]
+                rename = _rename_reserved_binding(bound_name, kind="Import", line=line)
+                if rename:
+                    alias.asname = rename["to"]
+                    renames.append(rename)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                bound_name = alias.asname or alias.name
+                rename = _rename_reserved_binding(bound_name, kind="ImportFrom", line=line)
+                if rename:
+                    alias.asname = rename["to"]
+                    renames.append(rename)
+    return renames
+
+
+class _ReservedConstructBindingRenamer(ast.NodeTransformer):
+    def __init__(self) -> None:
+        self.renames: list[dict[str, Any]] = []
+
+    def _rename_node(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> None:
+        rename = _rename_reserved_binding(
+            node.name,
+            kind=f"Local{type(node).__name__}",
+            line=getattr(node, "lineno", None),
+        )
+        if rename:
+            node.name = rename["to"]
+            self.renames.append(rename)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        self._rename_node(node)
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        self._rename_node(node)
+        return node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
+        self._rename_node(node)
+        return node
+
+    def visit_Assign(self, node: ast.Assign) -> ast.AST:
+        node.value = self.visit(node.value)
+        for target in node.targets:
+            self.renames.extend(
+                _rename_reserved_targets(
+                    target,
+                    kind="LocalAssign",
+                    line=getattr(node, "lineno", None),
+                )
+            )
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
+        if node.value is not None:
+            node.value = self.visit(node.value)
+        self.renames.extend(
+            _rename_reserved_targets(
+                node.target,
+                kind="LocalAnnAssign",
+                line=getattr(node, "lineno", None),
+            )
+        )
+        return node
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        node.value = self.visit(node.value)
+        self.renames.extend(
+            _rename_reserved_targets(
+                node.target,
+                kind="LocalAugAssign",
+                line=getattr(node, "lineno", None),
+            )
+        )
+        return node
+
+    def visit_For(self, node: ast.For) -> ast.AST:
+        node.iter = self.visit(node.iter)
+        self.renames.extend(
+            _rename_reserved_targets(
+                node.target,
+                kind="LocalForTarget",
+                line=getattr(node, "lineno", None),
+            )
+        )
+        node.body = [self.visit(statement) for statement in node.body]
+        node.orelse = [self.visit(statement) for statement in node.orelse]
+        return node
+
+    def visit_Import(self, node: ast.Import) -> ast.AST:
+        line = getattr(node, "lineno", None)
+        for alias in node.names:
+            bound_name = alias.asname or alias.name.split(".", 1)[0]
+            rename = _rename_reserved_binding(bound_name, kind="LocalImport", line=line)
+            if rename:
+                alias.asname = rename["to"]
+                self.renames.append(rename)
+        return node
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.AST:
+        line = getattr(node, "lineno", None)
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            bound_name = alias.asname or alias.name
+            rename = _rename_reserved_binding(bound_name, kind="LocalImportFrom", line=line)
+            if rename:
+                alias.asname = rename["to"]
+                self.renames.append(rename)
+        return node
+
+
+def sanitize_reserved_construct_bindings(construct: ast.FunctionDef) -> list[dict[str, Any]]:
+    renamer = _ReservedConstructBindingRenamer()
+    construct.body = [renamer.visit(statement) for statement in construct.body]
+    return renamer.renames
 
 
 def _static_iteration_count(node: ast.AST, sequence_lengths: dict[str, int] | None = None) -> int | None:
@@ -1241,23 +1430,61 @@ def prepare_narrated_scene_code(
         report["warning"] = f"Could not parse scene for automatic retiming: {exc}"
         return _insert_after_future_imports(code, helper), report
 
+    reserved_renames = sanitize_reserved_narration_names(tree)
+    construct = _target_construct_function(tree, scene_name)
+    if construct is not None:
+        reserved_renames.extend(sanitize_reserved_construct_bindings(construct))
+    if reserved_renames:
+        report["reserved_helper_name_renames"] = reserved_renames
+
     timeline_usage = _NarrationTimelineUsageVisitor()
     timeline_usage.visit(tree)
     report["explicit_timeline_call_count"] = timeline_usage.call_count
     report["explicit_timeline_used"] = timeline_usage.call_count > 0
+    segment_count = len(timing_plan.get("segments") or [])
+    if report["explicit_timeline_used"]:
+        covered_indices = sorted(
+            index for index in timeline_usage.segment_indices if 0 <= index < segment_count
+        )
+        missing_indices = [
+            index for index in range(segment_count) if index not in timeline_usage.segment_indices
+        ]
+        report["explicit_timeline_segment_count"] = segment_count
+        report["explicit_timeline_segment_call_count"] = timeline_usage.segment_call_count
+        report["explicit_timeline_segment_indices"] = covered_indices
+        report["explicit_timeline_covered_segment_count"] = len(set(covered_indices))
+        report["explicit_timeline_missing_segments"] = missing_indices
+        report["explicit_timeline_dynamic_segment_call_count"] = timeline_usage.dynamic_segment_call_count
+        report["explicit_timeline_coverage_ratio"] = (
+            round(len(set(covered_indices)) / segment_count, 3) if segment_count else 1.0
+        )
 
-    construct = _target_construct_function(tree, scene_name)
     if construct is None:
         report["warning"] = f"Could not find construct() for scene {scene_name!r}; using global video fit only."
-        return _insert_after_future_imports(code, helper), report
+        ast.fix_missing_locations(tree)
+        return _insert_after_future_imports(ast.unparse(tree), helper), report
 
     collector = _TimedCallCollector()
     for statement in construct.body:
         collector.visit(statement)
-    durations = allocate_timed_call_durations(collector.calls, timing_plan)
     report["timed_call_count"] = len(collector.calls)
     report["dynamic_loop_timed_call_count"] = collector.dynamic_loop_timed_calls
     report["static_loop_timed_call_count"] = collector.static_loop_timed_calls
+
+    if report["explicit_timeline_used"]:
+        if collector.calls or collector.dynamic_loop_timed_calls:
+            report["outside_timeline_timed_call_count"] = len(collector.calls)
+            report["warning"] = (
+                "Scene uses narration_timeline(...); ordinary self.play/self.wait calls "
+                "were left unchanged. Keep those calls short or move them into "
+                "tl.play_segment(...) / tl.wait_segment(...)."
+            )
+        else:
+            report["warning"] = "Scene uses narration_timeline(...); no automatic self.play/self.wait retiming was needed."
+        ast.fix_missing_locations(tree)
+        return _insert_after_future_imports(ast.unparse(tree), helper), report
+
+    durations = allocate_timed_call_durations(collector.calls, timing_plan)
     report["allocated_seconds"] = round(sum(durations), 3)
     report["call_durations_seconds"] = durations
     if collector.dynamic_loop_timed_calls:
@@ -1267,11 +1494,9 @@ def prepare_narrated_scene_code(
         )
 
     if not durations:
-        if report["explicit_timeline_used"]:
-            report["warning"] = "Scene uses narration_timeline(...); no automatic self.play/self.wait retiming was needed."
-        else:
-            report["warning"] = "No self.play(...) or self.wait(...) calls found; using global video fit only."
-        return _insert_after_future_imports(code, helper), report
+        report["warning"] = "No self.play(...) or self.wait(...) calls found; using global video fit only."
+        ast.fix_missing_locations(tree)
+        return _insert_after_future_imports(ast.unparse(tree), helper), report
 
     transformer = _TimedCallTransformer(collector.calls, durations)
     construct.body = [transformer.visit(statement) for statement in construct.body]
@@ -1706,6 +1931,21 @@ def mux_narration_audio(
         duration_delta = audio_duration - video_duration
         extra_duration = max(0.0, audio_duration - video_duration)
 
+    if sync_mode in {"timeline", "fit", "pad"} and (
+        video_duration is None or audio_duration is None
+    ):
+        missing = []
+        if video_duration is None:
+            missing.append("video")
+        if audio_duration is None:
+            missing.append("audio")
+        raise ValueError(
+            "Could not measure "
+            + " and ".join(missing)
+            + " duration with ffprobe. Narration sync requires ffprobe; without it, "
+            "ffmpeg can produce a video whose last frame sits idle while narration continues."
+        )
+
     if (
         sync_mode in {"timeline", "fit"}
         and video_duration is not None
@@ -2053,6 +2293,30 @@ def analyze_render_quality(metadata: dict[str, Any], *, visual_checks: bool = Tr
                 }
             )
 
+        if explicit_timeline:
+            segment_count = int(narration_sync.get("explicit_timeline_segment_count") or 0)
+            covered_count = int(narration_sync.get("explicit_timeline_covered_segment_count") or 0)
+            missing_segments = narration_sync.get("explicit_timeline_missing_segments") or []
+            dynamic_segment_calls = int(
+                narration_sync.get("explicit_timeline_dynamic_segment_call_count") or 0
+            )
+            if segment_count and covered_count < segment_count and not dynamic_segment_calls:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "incomplete_timeline_coverage",
+                        "message": (
+                            f"Only {covered_count} of {segment_count} narration segments are bound "
+                            "with tl.play_segment(...) or tl.wait_segment(...). Unbound narration "
+                            "segments can make the animation finish early and leave the final frame "
+                            "idle while audio continues."
+                        ),
+                        "covered_segment_count": covered_count,
+                        "segment_count": segment_count,
+                        "missing_segments": missing_segments,
+                    }
+                )
+
         audio_duration = narration_video.get("audio_duration_seconds")
         original_video_duration = narration_video.get("video_duration_seconds")
         mode = narration_video.get("mode")
@@ -2064,7 +2328,22 @@ def analyze_render_quality(metadata: dict[str, Any], *, visual_checks: bool = Tr
         ):
             delta = float(audio_duration) - float(original_video_duration)
             ratio = abs(delta) / max(float(audio_duration), 0.1)
-            if ratio > 0.15 and not explicit_timeline:
+            if ratio > 0.15 and explicit_timeline:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "severe_timeline_duration_mismatch",
+                        "message": (
+                            f"The timeline-rendered video duration ({original_video_duration:.2f}s) differed from "
+                            f"narration ({audio_duration:.2f}s) by {abs(delta):.2f}s. This usually means the "
+                            "scene shadowed the injected narration_timeline helper or has substantial timed "
+                            "self.play/self.wait calls outside the timeline."
+                        ),
+                        "delta_seconds": round(delta, 3),
+                        "ratio": round(ratio, 3),
+                    }
+                )
+            elif ratio > 0.15:
                 issues.append(
                     {
                         "severity": "error",
@@ -2965,20 +3244,18 @@ Use the manim MCP tool render_scene_with_narration with quality="{quality}",
 narration_sync_mode="timeline", narration_audio_mode="segmented",
 visual_quality_checks=true, and fail_on_quality_issues=true.
 
-Authoring rules:
-- Write narration_text first as 7 to 12 short sentences. Each sentence should be one visual beat.
-- Follow a human teaching structure: segment 0 introduces the topic/problem, segment 1 states what we are trying to understand, the middle segments build the explanation step by step, and the final segment summarizes the idea.
-- Do not jump straight to the final formula, answer, or finished diagram. Start by naming the question and showing the setup.
-- In the Manim code, call tl = narration_timeline(self) near the start of construct().
-- Bind every narration sentence, in order, with exactly one primary tl.play_segment(index, ...) or tl.wait_segment(index). Use self.add(...) only for instant setup.
-- Do not rely on automatic retiming for narrated scenes. Avoid timed self.play(...) or self.wait(...) outside the timeline helper.
-- Avoid timed animation calls inside loops with unknown length. If a loop is needed, make it over a literal list/range or use explicit segment indices.
-- Pace first drafts generously: prefer one clear motion plus one optional label/callout per segment instead of many rapid animations.
-- For wide systems such as orbits, timelines, graphs, or maps, put the full visual system in a VGroup and call fit_to_safe_frame(group) before animating it.
-- Keep labels, callouts, legends, and panels inside the visible frame with keep_in_safe_frame(...).
-- Prefer Text unless LaTeX is required; use Tex or MathTex only when the environment reports tex_ready=true.
-- If the first render fails a sync/layout quality gate, revise once using the reported issue and rerender before responding to the user.
-- Do not mention internal sync warnings in the final response when the final render succeeds. Just include the tool's final_response_markdown verbatim so the user sees Open video, Open player, and Video path.
+Rules:
+- Write narration_text first: 7 to 12 short sentences, one visual beat each.
+- Segment 0 introduces the topic/problem, segment 1 states the goal, middle segments explain step by step, final segment summarizes.
+- Do not jump straight to the final answer or finished diagram; show the setup first.
+- In construct(), call tl = narration_timeline(self), then bind every sentence once, in order, with tl.play_segment(index, ...) or tl.wait_segment(index).
+- Do not define or override narration_timeline, NarrationTimeline, fit_to_safe_frame, or keep_in_safe_frame.
+- Do not rely on automatic retiming; avoid timed self.play/self.wait outside tl and use self.add(...) only for instant setup.
+- Keep each beat simple: one focal motion and at most one active callout; fade or replace old labels before adding new ones.
+- For orbits, graphs, maps, networks, and other wide layouts, group the system and call fit_to_safe_frame(group); keep labels/callouts inside frame with keep_in_safe_frame(...).
+- Prefer Text unless LaTeX is required; use Tex/MathTex only when tex_ready=true.
+- If the first render fails a sync/layout quality gate, revise once and rerender.
+- Do not mention internal sync warnings after a successful final render; include final_response_markdown verbatim so the user sees Open video, Open player, and Video path.
 """.strip()
 
 
@@ -3114,9 +3391,13 @@ def render_scene_with_narration(
     except for instant setup via self.add(...). The automatic retimer can count
     literal range/list loops and simple local list/tuple/set assignments, but
     complex loops should use explicit segment calls.
+    Do not define custom helpers named `narration_timeline`,
+    `NarrationTimeline`, `fit_to_safe_frame`, or `keep_in_safe_frame`; the
+    server injects those.
 
     Pace first drafts generously: one clear motion plus one optional label or
     callout per narration sentence is usually better than many rapid animations.
+    Fade or replace old labels before adding new ones to avoid overlays.
     For frame-safe layouts, group large systems and call fit_to_safe_frame(group)
     before animating them; keep labels within the frame with keep_in_safe_frame.
     By default, severe sync drift or clipped-frame quality checks return a tool

@@ -19,6 +19,18 @@ class Demo(Scene):
 """
 
 
+def pretend_ffmpeg_available(monkeypatch) -> None:
+    """Keep mux unit tests independent of the runner's native ffmpeg install."""
+    original_which = server.shutil.which
+
+    def fake_which(command, path=None):
+        if command == "ffmpeg":
+            return "/fake/bin/ffmpeg"
+        return original_which(command, path=path)
+
+    monkeypatch.setattr(server.shutil, "which", fake_which)
+
+
 def test_infer_scene_name_single_scene() -> None:
     assert server.infer_scene_name(SIMPLE_SCENE) == "Demo"
 
@@ -371,9 +383,93 @@ class Demo(Scene):
 
     assert report["explicit_timeline_used"] is True
     assert report["explicit_timeline_call_count"] == 2
+    assert report["explicit_timeline_segment_indices"] == [0]
+    assert report["explicit_timeline_missing_segments"] == []
     assert report["scene_retimed"] is False
     assert "no automatic self.play/self.wait retiming was needed" in report["warning"]
     assert "NARRATION_TIMING" in code
+
+
+def test_prepare_narrated_scene_code_reports_missing_explicit_timeline_segments() -> None:
+    code, report = server.prepare_narrated_scene_code(
+        """
+from manim import *
+
+class Demo(Scene):
+    def construct(self):
+        tl = narration_timeline(self)
+        tl.play_segment(0, FadeIn(Square()))
+""",
+        scene_name="Demo",
+        timing_plan={
+            "segments": [
+                {"duration_seconds": 1.0},
+                {"duration_seconds": 1.0},
+                {"duration_seconds": 1.0},
+            ]
+        },
+        sync_mode="timeline",
+    )
+
+    assert report["explicit_timeline_used"] is True
+    assert report["explicit_timeline_segment_count"] == 3
+    assert report["explicit_timeline_covered_segment_count"] == 1
+    assert report["explicit_timeline_missing_segments"] == [1, 2]
+    assert report["explicit_timeline_coverage_ratio"] == pytest.approx(0.333)
+    assert "NARRATION_TIMING" in code
+
+
+def test_prepare_narrated_scene_code_protects_injected_timeline_helper() -> None:
+    code, report = server.prepare_narrated_scene_code(
+        """
+from manim import *
+
+def narration_timeline(scene):
+    return None
+
+class Demo(Scene):
+    def construct(self):
+        tl = narration_timeline(self)
+        tl.play_segment(0, FadeIn(Square()))
+        self.wait(1)
+""",
+        scene_name="Demo",
+        timing_plan={"segments": [{"duration_seconds": 2.0}]},
+        sync_mode="timeline",
+    )
+
+    assert report["reserved_helper_name_renames"][0]["from"] == "narration_timeline"
+    assert report["reserved_helper_name_renames"][0]["to"] == "_manim_mcp_user_narration_timeline"
+    assert report["scene_retimed"] is False
+    assert report["timed_call_count"] == 1
+    assert report["outside_timeline_timed_call_count"] == 1
+    assert code.count("def narration_timeline(scene):") == 1
+    assert "def _manim_mcp_user_narration_timeline(scene):" in code
+    assert "MANIM_MCP_CALL_DURATIONS = []" in code
+    assert "self.wait(1)" in code
+    assert "self.wait(_manim_mcp_next_duration" not in code
+
+
+def test_prepare_narrated_scene_code_protects_local_timeline_helper() -> None:
+    code, report = server.prepare_narrated_scene_code(
+        """
+from manim import *
+
+class Demo(Scene):
+    def construct(self):
+        def narration_timeline(scene):
+            return None
+        tl = narration_timeline(self)
+        tl.play_segment(0, FadeIn(Square()))
+""",
+        scene_name="Demo",
+        timing_plan={"segments": [{"duration_seconds": 2.0}]},
+        sync_mode="timeline",
+    )
+
+    assert report["reserved_helper_name_renames"][0]["kind"] == "LocalFunctionDef"
+    assert code.count("def narration_timeline(scene):") == 1
+    assert "def _manim_mcp_user_narration_timeline(scene):" in code
 
 
 def test_write_narrated_manim_scene_prompt_guides_sync_and_frame_safety() -> None:
@@ -712,6 +808,63 @@ def test_analyze_render_quality_flags_dynamic_loop_and_global_retime(tmp_path, m
     }
 
 
+def test_analyze_render_quality_flags_incomplete_timeline_coverage(tmp_path, monkeypatch) -> None:
+    video = tmp_path / "Demo.mp4"
+    video.write_bytes(b"video")
+    metadata = {
+        "success": True,
+        "narration_requested": True,
+        "narration_sync": {
+            "explicit_timeline_used": True,
+            "explicit_timeline_segment_count": 4,
+            "explicit_timeline_covered_segment_count": 2,
+            "explicit_timeline_missing_segments": [2, 3],
+            "explicit_timeline_dynamic_segment_call_count": 0,
+        },
+        "artifacts": [
+            {
+                "path": str(video.resolve()),
+                "uri": video.resolve().as_uri(),
+                "format": "mp4",
+                "mime_type": "video/mp4",
+                "size_bytes": video.stat().st_size,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        server,
+        "analyze_video_frame_bounds",
+        lambda path: {"ok": True, "edge_touch_count": 0, "content_sample_count": 3},
+    )
+
+    quality = server.analyze_render_quality(metadata)
+
+    assert quality["ok"] is False
+    assert quality["issues"][0]["code"] == "incomplete_timeline_coverage"
+    assert quality["issues"][0]["missing_segments"] == [2, 3]
+
+
+def test_analyze_render_quality_flags_timeline_duration_mismatch() -> None:
+    metadata = {
+        "success": True,
+        "narration_requested": True,
+        "narration_sync": {"explicit_timeline_used": True},
+        "narration": {
+            "video": {
+                "mode": "fit_video_to_audio",
+                "audio_duration_seconds": 60.0,
+                "video_duration_seconds": 90.0,
+            }
+        },
+        "artifacts": [],
+    }
+
+    quality = server.analyze_render_quality(metadata)
+
+    assert quality["ok"] is False
+    assert quality["issues"][0]["code"] == "severe_timeline_duration_mismatch"
+
+
 def test_analyze_render_quality_flags_frame_edge_contact(tmp_path, monkeypatch) -> None:
     video = tmp_path / "Demo.mp4"
     video.write_bytes(b"video")
@@ -776,6 +929,7 @@ def test_render_scene_tool_result_includes_links_for_quality_failed_artifacts(tm
 
 
 def test_mux_narration_pads_shorter_audio_to_video_duration(tmp_path, monkeypatch) -> None:
+    pretend_ffmpeg_available(monkeypatch)
     video_path = tmp_path / "video.mp4"
     audio_path = tmp_path / "audio.wav"
     output_path = tmp_path / "narrated.mp4"
@@ -807,6 +961,7 @@ def test_mux_narration_pads_shorter_audio_to_video_duration(tmp_path, monkeypatc
 
 
 def test_mux_narration_fits_video_to_audio_by_default(tmp_path, monkeypatch) -> None:
+    pretend_ffmpeg_available(monkeypatch)
     video_path = tmp_path / "video.mp4"
     audio_path = tmp_path / "audio.wav"
     output_path = tmp_path / "narrated.mp4"
@@ -837,7 +992,22 @@ def test_mux_narration_fits_video_to_audio_by_default(tmp_path, monkeypatch) -> 
     assert "setpts=2.50000000*PTS" in " ".join(result["command"])
 
 
+def test_mux_narration_requires_duration_measurements_for_sync(tmp_path, monkeypatch) -> None:
+    pretend_ffmpeg_available(monkeypatch)
+    video_path = tmp_path / "video.mp4"
+    audio_path = tmp_path / "audio.wav"
+    output_path = tmp_path / "narrated.mp4"
+    video_path.write_bytes(b"video")
+    audio_path.write_bytes(b"audio")
+
+    monkeypatch.setattr(server, "probe_media_duration", lambda path: None)
+
+    with pytest.raises(ValueError, match="Narration sync requires ffprobe"):
+        server.mux_narration_audio(video_path, audio_path, output_path, sync_mode="timeline")
+
+
 def test_mux_narration_rejects_output_without_audio_stream(tmp_path, monkeypatch) -> None:
+    pretend_ffmpeg_available(monkeypatch)
     video_path = tmp_path / "video.mp4"
     audio_path = tmp_path / "audio.wav"
     output_path = tmp_path / "narrated.mp4"

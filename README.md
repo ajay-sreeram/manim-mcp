@@ -71,7 +71,7 @@ You can force local TTS even when `HF_TOKEN` exists by passing `narration_provid
 
 Narration sync modes:
 
-- `timeline` (default): synthesize audio first, inject `NARRATION_TIMING`/`narration_timeline(self)`, and rewrite simple `self.play(...)`/`self.wait(...)` calls to match the spoken timeline. Static `range(...)` loops are accounted for.
+- `timeline` (default): synthesize audio first, inject `NARRATION_TIMING`/`narration_timeline(self)`, and let explicit `tl.play_segment(...)` / `tl.wait_segment(...)` calls use measured spoken durations. If no explicit timeline helper is used, simple `self.play(...)`/`self.wait(...)` calls are rewritten to match the spoken timeline. Static `range(...)` loops are accounted for.
 - `fit`: leave scene code alone, then retime the whole video to the narration duration.
 - `pad`: preserve video speed and only pad/freeze the ending if durations differ.
 
@@ -101,7 +101,7 @@ class Example(Scene):
         tl.wait_segment(2)
 ```
 
-Use `self.add(...)` for instant setup if needed, but avoid timed `self.play(...)` and `self.wait(...)` outside `tl.play_segment(...)` / `tl.wait_segment(...)` in narrated scenes. Automatic timeline mode also understands simple static loops, including literal `range(...)` loops and loops over locally assigned list/tuple/set literals. It rewrites those animations to consume measured per-segment durations at runtime. Loops over dynamic mobjects, comprehensions, external data, or objects built by function calls cannot be reliably counted, so narrated scenes should use explicit segment indices for those cases.
+Use `self.add(...)` for instant setup if needed, but avoid timed `self.play(...)` and `self.wait(...)` outside `tl.play_segment(...)` / `tl.wait_segment(...)` in narrated scenes. Do not define custom helpers named `narration_timeline`, `NarrationTimeline`, `fit_to_safe_frame`, or `keep_in_safe_frame`; the server injects them. Automatic timeline mode also understands simple static loops, including literal `range(...)` loops and loops over locally assigned list/tuple/set literals. It rewrites those animations to consume measured per-segment durations at runtime when no explicit timeline helper is used. Loops over dynamic mobjects, comprehensions, external data, or objects built by function calls cannot be reliably counted, so narrated scenes should use explicit segment indices for those cases.
 
 ## Quality Gates
 
@@ -111,7 +111,9 @@ The current checks flag:
 
 - Timed `self.play(...)` or `self.wait(...)` calls inside loops whose iteration count cannot be inferred.
 - Severe global retiming, where the silent video duration differs from narration by more than 15 percent and no explicit timeline helper was used.
+- Severe explicit-timeline duration mismatch, where a supposedly segment-bound scene still differs from narration by more than 15 percent.
 - Visual content touching the sampled video frame edge, which usually means labels, orbits, graphs, or panels are clipped.
+- Explicit timeline scenes that do not bind every narration sentence with `tl.play_segment(...)` or `tl.wait_segment(...)`.
 
 When a layout is wide, such as a solar system, graph, map, or timeline, build the full visual as a `VGroup` and call:
 
@@ -147,7 +149,7 @@ uv run manim-mcp-install-claude --source
 
 ## Native Dependencies
 
-This project does not install system packages automatically. On macOS, Manim needs native tools such as Cairo, `pkg-config`, Pango, and FFmpeg for video output. LaTeX plus `dvisvgm` is optional unless scenes use `Tex` or `MathTex`.
+This project does not install system packages automatically. On macOS, Manim needs native tools such as Cairo, `pkg-config`, Pango, and FFmpeg for video output. Narration sync also needs `ffprobe` so the server can measure video/audio duration before muxing. LaTeX plus `dvisvgm` is optional unless scenes use `Tex` or `MathTex`.
 
 The MCP server automatically prepends project-local TeX paths such as `.tinytex/bin/*` and `.texenv/bin` when checking tools and rendering scenes, so Claude Desktop does not need global TeX symlinks.
 
