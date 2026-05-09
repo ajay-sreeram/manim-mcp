@@ -12,3 +12,4 @@ prepared_narrations/
 dist/
 build/
 *.egg-info/
+depricated/
