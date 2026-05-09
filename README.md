@@ -9,7 +9,7 @@ Local MCP server for Claude Desktop that renders Manim Community Edition scenes 
   Successful renders return compact `Open video`, `Open player`, and `Video path` lines plus metadata. Media bytes and HTML resources are not embedded by default, keeping Claude Desktop tool results small and predictable.
   Pass `narration_text` to synthesize narration with hosted Hugging Face TTS or local Kokoro, save it as audio, and mux it into the rendered MP4.
 - `render_scene_with_narration`: same renderer, but with required `narration_text`. Use this when you ask Claude for voice, narration, audio, or a spoken explanation. By default it generates one audio file per narration segment, measures each segment's real duration, records actual Manim `Scene.time` starts during render, aligns audio to those rendered beats, and verifies that the final MP4 has an audio stream. If `HF_TOKEN` is available, narration uses the hosted Hugging Face Inference API; otherwise it falls back to local Kokoro.
-- `prepare_narration`: optional first step for complex narrated videos. It generates narration audio, returns exact segment durations plus audio paths, and gives Claude a `prepared_narration_id` to use while planning a full Manim scene.
+- `prepare_narration`: optional first step for complex narrated videos. It generates narration audio, returns exact segment durations plus compact relative audio paths such as `narration/segments/000.wav`, and gives Claude a `prepared_narration_id` to use while planning a full Manim scene.
 - `render_scene_with_prepared_narration`: renders one complete Manim scene using audio/timing from `prepare_narration`. Claude still writes normal Manim code with full Manim freedom; the server owns muxing, measured sync, and quality feedback.
 - `plan_narration_timing`: returns a draft sentence-level timing plan without rendering, useful when writing a scene that explicitly uses the injected `narration_timeline(self)` helper. Final segmented renders replace heuristic durations with measured TTS durations.
 - `get_render_access`: returns only the compact access block for a render job, useful when Claude says a video is ready but does not show the video links. Use `job_id="latest"` for the newest render.
@@ -105,6 +105,8 @@ class Example(Scene):
 
 Use `self.add(...)` for instant setup if needed, but keep important timed motion inside `tl.play_segment(...)` / `tl.wait_segment(...)` in narrated scenes. Short transition waits are allowed; timeline mode measures them and can align audio around them. If there are N narration sentences, valid segment indices are `0` through `N - 1`. Do not define custom helpers named `narration_timeline`, `NarrationTimeline`, `fit_to_safe_frame`, or `keep_in_safe_frame`; the server injects them. Automatic timeline mode also understands simple static loops, including literal `range(...)` loops and loops over locally assigned list/tuple/set literals. It rewrites those animations to consume measured per-segment durations at runtime when no explicit timeline helper is used. Loops over dynamic mobjects, comprehensions, external data, or objects built by function calls cannot be reliably counted, so narrated scenes should use explicit segment indices for those cases.
 
+For slide-like explainers, do not let visuals accumulate across subtopics. Put the visible objects for a beat in a `VGroup`, fade that group out or call `self.clear()` before building the next beat, then introduce the next visual. If submobjects were animated one by one, removing only the parent `VGroup` may leave old pieces on screen.
+
 ## Quality Gates
 
 Narrated renders default to `fail_on_quality_issues=true`. A render can finish and still be returned as a tool error when the server detects likely bad output. The error still includes `Open video`, `Open player`, and `Video path` lines so you can inspect the artifact.
@@ -118,6 +120,7 @@ The current checks flag:
 - Explicit timeline scenes that do not bind every narration sentence with `tl.play_segment(...)` or `tl.wait_segment(...)`.
 - Out-of-range timeline indices, as warnings. Extra out-of-range waits become short pauses instead of crashing Manim.
 - Visual/narration beat drift, such as a labeled visual matching the next narration sentence better than the sentence it is bound to.
+- Visual clutter density, where sampled frames contain too many visible objects, labels, arrows, or old scene elements at once.
 
 When a layout is wide, such as a solar system, graph, map, or timeline, build the full visual as a `VGroup` and call:
 
@@ -200,10 +203,10 @@ Use the manim MCP server tool render_scene_with_narration to render a low qualit
 For a complex narrated video:
 
 ```text
-Use prepare_narration first so you know exact sentence durations, then create an attractive Manim scene with full Manim capabilities and call render_scene_with_prepared_narration. Bind each narration segment to the matching visual beat with narration_timeline(self).
+Use prepare_narration first so you know exact sentence durations, then storyboard one visual beat per sentence and call render_scene_with_prepared_narration. Use full Manim capabilities, but keep each beat readable, fade or clear old VGroups between subtopics, and bind each narration segment to the matching visual beat with narration_timeline(self).
 ```
 
-For more complex narrated scenes, use the MCP prompt `write_narrated_manim_scene`. It tells Claude to write the narration first, introduce the topic/problem before solving, bind each sentence to `tl.play_segment(...)` or `tl.wait_segment(...)`, and use `fit_to_safe_frame(...)` for large layouts.
+For more complex narrated scenes, use the MCP prompt `write_narrated_manim_scene`. It tells Claude to write the narration first, introduce the topic/problem before solving, storyboard readable visual beats, bind each sentence to `tl.play_segment(...)` or `tl.wait_segment(...)`, clear old groups between subtopics, and use `fit_to_safe_frame(...)` for large layouts.
 
 Claude Desktop currently surfaces the returned links more reliably than inline MCP UI resources. By default this server does not embed `ui://` HTML or media bytes. It still creates a small local player page for the `Open player` link, but it does not show a separate redundant `preview.html` link in normal responses.
 

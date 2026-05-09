@@ -1846,6 +1846,19 @@ def _manim_mcp_scene_time(scene):
         return 0.0
 
 
+def _manim_mcp_mobject_family_count(scene):
+    try:
+        stack = list(getattr(scene, "mobjects", []))
+        count = 0
+        while stack:
+            mobject = stack.pop()
+            count += 1
+            stack.extend(list(getattr(mobject, "submobjects", [])))
+        return count
+    except Exception:
+        return None
+
+
 def _manim_mcp_json_value(value):
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -1881,6 +1894,7 @@ def _manim_mcp_patch_scene_instance(scene):
         start = _manim_mcp_scene_time(scene)
         result = original_play(*args, **kwargs)
         end = _manim_mcp_scene_time(scene)
+        mobject_count = _manim_mcp_mobject_family_count(scene)
         _manim_mcp_record_event(
             MANIM_MCP_OUTSIDE_TIMED_EVENTS,
             dict(
@@ -1890,6 +1904,7 @@ def _manim_mcp_patch_scene_instance(scene):
                 requested_run_time=_manim_mcp_json_value(kwargs.get("run_time")),
                 start_seconds=start,
                 end_seconds=end,
+                end_mobject_family_count=mobject_count,
             ),
         )
         return result
@@ -1905,6 +1920,7 @@ def _manim_mcp_patch_scene_instance(scene):
         finally:
             MANIM_MCP_IN_OUTSIDE_WAIT -= 1
         end = _manim_mcp_scene_time(scene)
+        mobject_count = _manim_mcp_mobject_family_count(scene)
         requested = args[0] if args else kwargs.get("duration")
         _manim_mcp_record_event(
             MANIM_MCP_OUTSIDE_TIMED_EVENTS,
@@ -1914,6 +1930,7 @@ def _manim_mcp_patch_scene_instance(scene):
                 requested_duration=_manim_mcp_json_value(requested),
                 start_seconds=start,
                 end_seconds=end,
+                end_mobject_family_count=mobject_count,
             ),
         )
         return result
@@ -1997,6 +2014,7 @@ class NarrationTimeline:
         target_duration = max(0.05, float(segment["duration_seconds"]))
         run_time = max(0.05, self.duration(index) - max(0.0, hold))
         start = _manim_mcp_scene_time(self.scene)
+        start_mobject_count = _manim_mcp_mobject_family_count(self.scene)
         MANIM_MCP_IN_TIMELINE_CALL += 1
         try:
             if animations:
@@ -2008,6 +2026,7 @@ class NarrationTimeline:
         finally:
             MANIM_MCP_IN_TIMELINE_CALL -= 1
         end = _manim_mcp_scene_time(self.scene)
+        end_mobject_count = _manim_mcp_mobject_family_count(self.scene)
         _manim_mcp_record_event(
             MANIM_MCP_TIMELINE_EVENTS,
             dict(
@@ -2021,6 +2040,8 @@ class NarrationTimeline:
                 animation_count=len(animations),
                 start_seconds=start,
                 end_seconds=end,
+                start_mobject_family_count=start_mobject_count,
+                end_mobject_family_count=end_mobject_count,
             ),
         )
 
@@ -2029,12 +2050,14 @@ class NarrationTimeline:
         segment = self.segment(index)
         target_duration = max(0.05, self.duration(index) * scale)
         start = _manim_mcp_scene_time(self.scene)
+        start_mobject_count = _manim_mcp_mobject_family_count(self.scene)
         MANIM_MCP_IN_TIMELINE_CALL += 1
         try:
             self.scene.wait(target_duration)
         finally:
             MANIM_MCP_IN_TIMELINE_CALL -= 1
         end = _manim_mcp_scene_time(self.scene)
+        end_mobject_count = _manim_mcp_mobject_family_count(self.scene)
         _manim_mcp_record_event(
             MANIM_MCP_TIMELINE_EVENTS,
             dict(
@@ -2047,6 +2070,8 @@ class NarrationTimeline:
                 animation_count=0,
                 start_seconds=start,
                 end_seconds=end,
+                start_mobject_family_count=start_mobject_count,
+                end_mobject_family_count=end_mobject_count,
             ),
         )
 
@@ -2717,6 +2742,83 @@ def synthesize_segmented_narration_audio(
     return audio, timing_plan
 
 
+def _relative_to_any_root(path: Path, roots: list[Path]) -> str:
+    resolved = path.resolve()
+    for root in roots:
+        try:
+            root_resolved = root.resolve()
+            return resolved.relative_to(root_resolved).as_posix()
+        except ValueError:
+            continue
+    return path.name
+
+
+def public_audio_metadata(audio: dict[str, Any], roots: list[Path]) -> dict[str, Any]:
+    """Return compact audio metadata without absolute local paths or command logs."""
+    omitted_keys = {
+        "uri",
+        "source_uri",
+        "source_path",
+        "concat_command",
+        "concat_stdout_tail",
+        "concat_stderr_tail",
+        "alignment_command",
+        "alignment_stdout_tail",
+        "alignment_stderr_tail",
+    }
+
+    def convert(value: Any, key: str | None = None) -> Any:
+        if key in omitted_keys:
+            return None
+        if key == "path" and isinstance(value, str):
+            return _relative_to_any_root(Path(value), roots)
+        if isinstance(value, dict):
+            cleaned: dict[str, Any] = {}
+            for item_key, item_value in value.items():
+                converted = convert(item_value, item_key)
+                if converted is not None:
+                    cleaned[item_key] = converted
+            return cleaned
+        if isinstance(value, list):
+            return [converted for item in value if (converted := convert(item)) is not None]
+        return value
+
+    return convert(audio)
+
+
+def hydrate_prepared_audio_metadata(audio: dict[str, Any], root: Path) -> dict[str, Any]:
+    """Resolve prepared narration relative paths for internal rendering use."""
+    def hydrate(value: Any, key: str | None = None) -> Any:
+        if isinstance(value, dict):
+            return {item_key: hydrate(item_value, item_key) for item_key, item_value in value.items()}
+        if isinstance(value, list):
+            return [hydrate(item) for item in value]
+        if key == "path" and isinstance(value, str):
+            path = Path(value)
+            resolved = path if path.is_absolute() else root / path
+            return str(resolved.resolve())
+        return value
+
+    hydrated = hydrate(audio)
+
+    def add_uris(value: Any) -> None:
+        if isinstance(value, dict):
+            path = value.get("path")
+            if isinstance(path, str):
+                try:
+                    value["uri"] = Path(path).resolve().as_uri()
+                except Exception:
+                    pass
+            for item_value in value.values():
+                add_uris(item_value)
+        elif isinstance(value, list):
+            for item in value:
+                add_uris(item)
+
+    add_uris(hydrated)
+    return hydrated
+
+
 def _prepared_narration_path(prepared_narration_id: str) -> Path:
     if not JOB_ID_RE.match(prepared_narration_id):
         raise ValueError("prepared_narration_id is not valid.")
@@ -2745,7 +2847,7 @@ def prepare_narration_metadata(
 
     prepared_id = _new_job_id()
     narration_dir = PREPARED_NARRATION_ROOT / prepared_id
-    audio_dir = narration_dir / "audio"
+    audio_dir = narration_dir / "narration"
     narration_dir.mkdir(parents=True, exist_ok=False)
     audio_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = narration_dir / "metadata.json"
@@ -2790,16 +2892,18 @@ def prepare_narration_metadata(
                 total_duration_seconds=audio.get("duration_seconds"),
             )
         timing_path.write_text(json.dumps(timing_plan, indent=2) + "\n", encoding="utf-8")
+        public_audio = public_audio_metadata(audio, [narration_dir])
         metadata.update(
             {
                 "success": True,
                 "duration_seconds": round(time.monotonic() - started, 3),
-                "audio": audio,
+                "audio": public_audio,
                 "timing_plan": timing_plan,
                 "usage": (
                     "Use this prepared_narration_id with render_scene_with_prepared_narration. "
-                    "Write one coherent Manim Scene, use the returned segment durations to pace "
-                    "visual beats, and let the server mux the prepared audio."
+                    "Write one coherent Manim Scene. Use the returned segment durations to "
+                    "storyboard visual beats, keep each beat readable, clear old scene groups "
+                    "between subtopics, and let the server mux the prepared audio."
                 ),
             }
         )
@@ -2831,6 +2935,7 @@ def load_prepared_narration(prepared_narration_id: str) -> dict[str, Any]:
         )
     if not metadata.get("audio") or not metadata.get("timing_plan"):
         raise ValueError(f"Prepared narration {prepared_narration_id!r} is missing audio or timing data.")
+    metadata["audio"] = hydrate_prepared_audio_metadata(metadata["audio"], narration_dir)
     return metadata
 
 
@@ -3176,6 +3281,10 @@ def _frame_content_bounds(
 
     if content_pixels < 20:
         return None
+    total_sampled_pixels = ((width + step - 1) // step) * ((height + step - 1) // step)
+    bbox_width = max_x - min_x + 1
+    bbox_height = max_y - min_y + 1
+    sampled_bbox_pixels = max(1, ((bbox_width + step - 1) // step) * ((bbox_height + step - 1) // step))
     return {
         "background_rgb": background,
         "bbox": {
@@ -3183,10 +3292,12 @@ def _frame_content_bounds(
             "y_min": min_y,
             "x_max": max_x,
             "y_max": max_y,
-            "width": max_x - min_x + 1,
-            "height": max_y - min_y + 1,
+            "width": bbox_width,
+            "height": bbox_height,
         },
         "sampled_content_pixels": content_pixels,
+        "content_pixel_ratio": round(content_pixels / max(total_sampled_pixels, 1), 4),
+        "bbox_fill_ratio": round(content_pixels / sampled_bbox_pixels, 4),
     }
 
 
@@ -3241,6 +3352,11 @@ def analyze_video_frame_bounds(
 
     checked = sum(1 for sample in samples if sample.get("content_detected"))
     edge_hit_ratio = edge_hits / checked if checked else 0.0
+    content_ratios = [
+        float(sample.get("content_pixel_ratio") or 0.0)
+        for sample in samples
+        if sample.get("content_detected")
+    ]
     return {
         "ok": edge_hits == 0,
         "width": width,
@@ -3250,6 +3366,10 @@ def analyze_video_frame_bounds(
         "content_sample_count": checked,
         "edge_touch_count": edge_hits,
         "edge_hit_ratio": round(edge_hit_ratio, 3),
+        "max_content_pixel_ratio": round(max(content_ratios), 3) if content_ratios else 0.0,
+        "avg_content_pixel_ratio": round(sum(content_ratios) / len(content_ratios), 3)
+        if content_ratios
+        else 0.0,
         "edge_margin_px": edge_margin_px,
         "samples": samples,
     }
@@ -3278,8 +3398,10 @@ def load_narration_timeline_actual(
     enriched_events: list[dict[str, Any]] = []
     max_abs_start_delta = 0.0
     max_abs_end_delta = 0.0
+    max_mobject_count = 0
     worst_start_event: dict[str, Any] | None = None
     worst_end_event: dict[str, Any] | None = None
+    worst_mobject_event: dict[str, Any] | None = None
 
     for event in actual.get("timeline_events") or []:
         enriched = dict(event)
@@ -3312,14 +3434,20 @@ def load_narration_timeline_actual(
             if abs(end_delta) > max_abs_end_delta:
                 max_abs_end_delta = abs(end_delta)
                 worst_end_event = enriched
+        mobject_count = enriched.get("end_mobject_family_count")
+        if isinstance(mobject_count, int | float) and int(mobject_count) > max_mobject_count:
+            max_mobject_count = int(mobject_count)
+            worst_mobject_event = enriched
         enriched_events.append(enriched)
 
     actual["timeline_events"] = enriched_events
     actual["sync_summary"] = {
         "max_abs_start_delta_seconds": round(max_abs_start_delta, 3),
         "max_abs_end_delta_seconds": round(max_abs_end_delta, 3),
+        "max_end_mobject_family_count": max_mobject_count,
         "worst_start_event": worst_start_event,
         "worst_end_event": worst_end_event,
+        "worst_mobject_event": worst_mobject_event,
     }
     return actual
 
@@ -3395,6 +3523,23 @@ def analyze_render_quality(metadata: dict[str, Any], *, visual_checks: bool = Tr
                 )
             sync_summary = timeline_actual.get("sync_summary") or {}
             max_start_delta = float(sync_summary.get("max_abs_start_delta_seconds") or 0.0)
+            max_mobject_count = int(sync_summary.get("max_end_mobject_family_count") or 0)
+            if max_mobject_count > 140:
+                worst_event = sync_summary.get("worst_mobject_event") or {}
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "timeline_scene_mobject_clutter",
+                        "message": (
+                            f"A timeline segment ended with about {max_mobject_count} visible "
+                            "mobject family members. This often means previous scene elements "
+                            "were not cleared and are overlapping. Fade out the current scene "
+                            "group or call self.clear() before building the next visual beat."
+                        ),
+                        "max_end_mobject_family_count": max_mobject_count,
+                        "segment_index": worst_event.get("segment_index"),
+                    }
+                )
             if max_start_delta > 0.75:
                 worst_event = sync_summary.get("worst_start_event") or {}
                 audio_timeline_aligned = bool(narration_audio.get("timeline_aligned"))
@@ -3525,6 +3670,26 @@ def analyze_render_quality(metadata: dict[str, Any], *, visual_checks: bool = Tr
                     "edge_hit_ratio": bounds.get("edge_hit_ratio"),
                 }
             )
+        max_content_ratio = float(bounds.get("max_content_pixel_ratio") or 0.0)
+        avg_content_ratio = float(bounds.get("avg_content_pixel_ratio") or 0.0)
+        if bounds.get("content_sample_count", 0) >= 3 and (
+            max_content_ratio > 0.15 or avg_content_ratio > 0.11
+        ):
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "visual_clutter_density",
+                    "message": (
+                        "Sampled frames look visually dense, which often means too many labels, "
+                        "arrows, boxes, or previous-scene objects are visible at once. Use a "
+                        "clean storyboard: one focal visual per narration segment, fade/clear "
+                        "old groups, and reveal complex diagrams in smaller stages."
+                    ),
+                    "max_content_pixel_ratio": round(max_content_ratio, 3),
+                    "avg_content_pixel_ratio": round(avg_content_ratio, 3),
+                    "content_sample_count": bounds.get("content_sample_count"),
+                }
+            )
         metadata["visual_bounds"] = bounds
 
     ok = not any(issue["severity"] == "error" for issue in issues)
@@ -3578,7 +3743,6 @@ def add_narration_to_render(
             narration_dir / "narration.timeline.wav",
             timeout_seconds=mux_timeout_seconds,
         )
-    metadata["narration_audio"] = audio
     muxed_video = mux_narration_audio(
         original_video_path,
         Path(audio["path"]),
@@ -3586,9 +3750,16 @@ def add_narration_to_render(
         sync_mode=sync_mode,
         timeout_seconds=mux_timeout_seconds,
     )
+    public_roots = [job_dir]
+    prepared = metadata.get("prepared_narration") or {}
+    prepared_dir = prepared.get("prepared_narration_dir")
+    if isinstance(prepared_dir, str):
+        public_roots.append(Path(prepared_dir))
+    public_audio = public_audio_metadata(audio, public_roots)
+    metadata["narration_audio"] = public_audio
     metadata["narration"] = {
         "text": narration_text,
-        "audio": audio,
+        "audio": public_audio,
         "video": muxed_video,
     }
     metadata["artifacts"] = discover_artifacts(Path(metadata["media_dir"]))
@@ -4223,10 +4394,13 @@ def _render_scene_metadata(
             narration_dir = job_dir / "narration"
             narration_dir.mkdir(parents=True, exist_ok=True)
             pre_render_audio_path = narration_dir / "narration.wav"
+            public_audio_roots = [job_dir]
             if prepared_narration:
                 pre_render_audio = prepared_narration["audio"]
                 pre_render_audio_path = Path(pre_render_audio["path"])
                 timing_plan = prepared_narration["timing_plan"]
+                prepared_dir = Path(prepared_narration["prepared_narration_dir"])
+                public_audio_roots.append(prepared_dir)
                 metadata["prepared_narration"] = {
                     "prepared_narration_id": prepared_narration["prepared_narration_id"],
                     "prepared_narration_dir": prepared_narration["prepared_narration_dir"],
@@ -4267,7 +4441,7 @@ def _render_scene_metadata(
             metadata.update(
                 {
                     "source_script_path": str(source_script_path.resolve()),
-                    "narration_audio": pre_render_audio,
+                    "narration_audio": public_audio_metadata(pre_render_audio, public_audio_roots),
                     "narration_timing_plan": timing_plan,
                     "narration_timing_path": str(timing_path.resolve()),
                     "narration_sync": sync_report,
@@ -4424,11 +4598,11 @@ def prepare_narration(
     """Prepare narration audio and exact segment timings before writing a scene.
 
     Use this optional first step for complex narrated videos. It returns a
-    prepared_narration_id, combined audio path, per-sentence durations, and
-    per-segment audio paths. Claude should use those durations to plan a full
-    Manim scene with attractive visuals, then call
-    render_scene_with_prepared_narration. Do not inject audio playback code into
-    Manim; the server will mux and verify the prepared audio after render.
+    prepared_narration_id, compact relative audio paths, and exact per-sentence
+    durations. Use those durations to storyboard a full Manim scene before
+    rendering: one narration segment maps to one clear visual beat. Do not
+    inject audio playback code into Manim; the server muxes and verifies the
+    prepared audio after render.
     """
     return prepare_narration_metadata(
         narration_text,
@@ -4450,22 +4624,29 @@ def write_narrated_manim_scene_prompt(topic: str, quality: str = "low") -> str:
     return f"""
 Create and render a narrated ManimCE scene about: {topic}
 
-For complex explanations, call prepare_narration first, use the returned
-durations to plan the scene, then call render_scene_with_prepared_narration.
-For quick/simple explanations, call render_scene_with_narration directly.
-Use quality="{quality}", narration_sync_mode="timeline",
-narration_audio_mode="segmented", visual_quality_checks=true, and
-fail_on_quality_issues=true.
+Recommended workflow:
+- For complex explanations, call prepare_narration first, use the returned durations to plan the visual beats, then call render_scene_with_prepared_narration.
+- For quick/simple explanations, call render_scene_with_narration directly.
+- Use quality="{quality}", narration_sync_mode="timeline", narration_audio_mode="segmented", visual_quality_checks=true, and fail_on_quality_issues=true.
 
-Rules:
-- Use ManimCE normally; the MCP helpers are for timing/framing, not a replacement for Manim.
-- Write narration_text first: 6 to 10 short sentences. Sentence 0 introduces the topic/problem, sentence 1 states the goal, middle sentences explain step by step, final sentence summarizes.
-- In construct(), use tl = narration_timeline(self), then bind each sentence once with tl.play_segment(index, ...) or tl.wait_segment(index). The visual in segment i must depict narration sentence i; if a sentence names "fuel -> engine -> wheels", reveal that flow in the same segment.
-- Keep timed self.play/self.wait calls inside tl segments; use self.add/self.remove for instant setup/cleanup. Transitions also belong inside the narration segment they support.
+Narration contract:
+- Write narration_text first: 6 to 10 short sentences.
+- Sentence 0 introduces the topic/problem. Sentence 1 states the viewer goal. Middle sentences explain step by step. Final sentence summarizes.
+- In construct(), create tl = narration_timeline(self), then bind sentence i to visual beat i with tl.play_segment(i, ...) or tl.wait_segment(i).
+
+Visual contract:
+- Use ManimCE normally and creatively; helpers are only for timing and frame safety.
+- Make the video attractive: use color, depth, smooth transforms, indications, camera moves, traced paths, graphs, 3D, and layered VGroups when they clarify the idea.
+- Keep each beat readable: one focal visual idea, a small number of labels, and motion that directly matches the current narration sentence.
+- The visual in segment i must depict narration sentence i; do not play visuals one sentence early or late.
+- Avoid visual pile-ups. For slide-like subtopics, put visible objects in a beat VGroup, fade it out or call self.clear() before the next subtopic, then build the next beat.
+- If you animated submobjects individually, do not rely on self.remove(parent_group) to clean them up; use FadeOut on the visible pieces, self.remove(*objects), or self.clear().
 - Use fit_to_safe_frame(group) for wide layouts and keep_in_safe_frame(label) for floating labels/callouts.
-- Make it visually engaging: use tasteful color, depth, motion, highlights, transforms, indications, camera moves, traced paths, graphs, 3D, and layered VGroups when they help. Keep each beat readable: one main idea per narration sentence, then hold on the final frame until the sentence finishes.
+
+Code rules:
+- Keep timed self.play/self.wait calls inside tl segments; use self.add/self.remove/self.clear for instant setup or cleanup.
 - Avoid common Python mistakes: do not reuse comprehension variables like i or p after a comprehension.
-- Prefer Text unless LaTeX is really needed and tex_ready=true.
+- Prefer Text. Use Tex/MathTex only if check_environment reports tex_ready=true.
 - If the tool returns a render or quality error, fix the reported diagnostic and rerender once. On success, include final_response_markdown verbatim.
 """.strip()
 
@@ -4596,7 +4777,9 @@ def render_scene_with_narration(
     first sentence should introduce the topic/problem, the second should state
     what the video will help the viewer understand, the middle sentences should
     explain step by step, and the final sentence should summarize. Do not jump
-    straight to the final formula, answer, or finished diagram.
+    straight to the final formula, answer, or finished diagram. For complex
+    topics, storyboard the visual beats before coding, especially if using
+    prepare_narration durations.
 
     Use explicit timeline beats by default: call `tl = narration_timeline(self)`
     near the start of construct(), then bind every narration sentence in order
@@ -4608,6 +4791,11 @@ def render_scene_with_narration(
     Avoid timed self.play/self.wait outside the helper; use self.add/self.remove
     for instant setup/cleanup. Short transition pauses are allowed, but
     important visual motion should happen inside the segment that explains it.
+    Avoid visual pile-ups: for slide-like explanations, keep visible objects for
+    one beat in a `VGroup`, fade that group out or call `self.clear()` before the
+    next subtopic, then build the next beat. If submobjects were animated
+    individually, removing only the parent group may leave old pieces on screen;
+    use FadeOut on the visible pieces, self.remove(*objects), or self.clear().
     The automatic retimer can count literal
     range/list loops and simple local list/tuple/set assignments, but complex
     loops should use explicit segment calls. Do not reuse comprehension
@@ -4618,9 +4806,9 @@ def render_scene_with_narration(
 
     Make the video attractive enough to hold attention: use tasteful color,
     depth, smooth transforms, indications, camera moves, updaters, paths,
-    graphs, 3D scenes, and layered groups when they help the explanation. Pace
-    first drafts generously: one clear idea plus one optional label or callout
-    per narration sentence is usually better than many unrelated motions.
+    graphs, 3D scenes, and layered groups when they clarify the idea. Keep each
+    beat readable: one focal visual idea and a small number of labels usually
+    works better than many unrelated objects on screen.
     Fade or replace old labels before adding new ones to avoid overlays.
     For frame-safe layouts, group large systems and call fit_to_safe_frame(group)
     before animating them; keep labels within the frame with keep_in_safe_frame.
@@ -4678,18 +4866,20 @@ def render_scene_with_prepared_narration(
 ) -> CallToolResult:
     """Render a ManimCE MP4 using audio from prepare_narration.
 
-    Use this after prepare_narration for higher-quality narrated videos. Claude
-    should write one complete Manim scene and may use any Manim capability:
+    Use this after prepare_narration for higher-quality narrated videos. Write
+    one complete Manim scene and use any Manim capability:
     transforms, updaters, camera movement, 3D scenes, graphs, paths, and rich
-    VGroup compositions are all allowed. The prepared timing plan is guidance
-    for pacing; the server still owns audio muxing, actual render-time sync
-    measurement, and quality feedback.
+    VGroup compositions are all allowed. Use the prepared timing plan to
+    storyboard pacing before coding; the server still owns audio muxing, actual
+    render-time sync measurement, and quality feedback.
 
     In timeline mode, use `tl = narration_timeline(self)` and bind narration
     sentence i to visual beat i with `tl.play_segment(i, ...)` or
     `tl.wait_segment(i)`. Make the visuals attractive and viewer-friendly, but
-    keep them readable and inside the frame. On success, include
-    `final_response_markdown` verbatim in the assistant response.
+    keep them readable and inside the frame. Fade or clear old beat groups
+    between subtopics so earlier diagrams do not accumulate under later
+    animations. On success, include `final_response_markdown` verbatim in the
+    assistant response.
     """
     return render_scene(
         code=code,
