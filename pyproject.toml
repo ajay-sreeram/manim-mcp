@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manim-mcp"
+version = "0.1.0"
+description = "A Claude Desktop MCP server for rendering Manim Community Edition scenes."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "ajay-sreeram" },
+]
+keywords = ["claude", "mcp", "manim", "animation", "text-to-speech"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = [
+    "huggingface-hub>=1.13.0",
+    "kokoro>=0.9.2",
+    "manim>=0.20.1",
+    "mcp[cli]>=1.4.1",
+    "soundfile>=0.12.1",
+]
+
+[project.scripts]
+manim-mcp = "manim_mcp.server:main"
+manim-mcp-install-claude = "manim_mcp.claude_config:main"
+
+[project.urls]
+Homepage = "https://github.com/ajay-sreeram/manim-mcp"
+Repository = "https://github.com/ajay-sreeram/manim-mcp"
+Issues = "https://github.com/ajay-sreeram/manim-mcp/issues"
+
+[dependency-groups]
+dev = [
+    "build>=1.5.0",
+    "pytest>=8.3.5",
+    "twine>=6.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manim_mcp"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.env",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.tinytex",
+    "/.venv",
+    "/build",
+    "/dist",
+    "/renders",
+]

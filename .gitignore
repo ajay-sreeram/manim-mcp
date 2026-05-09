@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.venv/
+.texenv/
+.tinytex/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+renders/
+dist/
+build/
+*.egg-info/
