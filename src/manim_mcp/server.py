@@ -49,9 +49,11 @@ def _default_project_root() -> Path:
 
 PROJECT_ROOT = _default_project_root()
 RENDER_ROOT = PROJECT_ROOT / "renders"
+PREPARED_NARRATION_ROOT = PROJECT_ROOT / "prepared_narrations"
 MAX_CODE_CHARS = 200_000
 JOB_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[a-f0-9]{8}$")
 WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?")
+TIMELINE_SEGMENT_METHODS = {"play_segment", "wait_segment"}
 
 Quality = Literal["low", "medium", "high", "production", "fourk"]
 OutputFormat = Literal["mp4", "png", "gif", "webm", "mov"]
@@ -89,6 +91,131 @@ RESERVED_NARRATION_HELPER_NAMES = {
     "fit_to_safe_frame",
     "keep_in_safe_frame",
     "narration_timeline",
+}
+TERM_STOPWORDS = {
+    "about",
+    "above",
+    "after",
+    "again",
+    "against",
+    "along",
+    "also",
+    "and",
+    "are",
+    "because",
+    "before",
+    "below",
+    "between",
+    "but",
+    "can",
+    "down",
+    "each",
+    "finally",
+    "for",
+    "from",
+    "give",
+    "goes",
+    "how",
+    "inside",
+    "into",
+    "its",
+    "let",
+    "like",
+    "more",
+    "not",
+    "now",
+    "off",
+    "one",
+    "onto",
+    "our",
+    "out",
+    "over",
+    "put",
+    "see",
+    "several",
+    "show",
+    "step",
+    "that",
+    "the",
+    "then",
+    "this",
+    "through",
+    "together",
+    "too",
+    "under",
+    "use",
+    "using",
+    "what",
+    "when",
+    "where",
+    "while",
+    "with",
+    "working",
+    "you",
+}
+VISUAL_TERM_IGNORE = TERM_STOPWORDS | {
+    "add",
+    "align",
+    "animate",
+    "arrow",
+    "arrows",
+    "arrange",
+    "axis",
+    "blue",
+    "buff",
+    "center",
+    "circle",
+    "color",
+    "corner",
+    "create",
+    "dark",
+    "dot",
+    "edge",
+    "fade",
+    "fadein",
+    "fadeout",
+    "fill",
+    "font",
+    "green",
+    "group",
+    "height",
+    "label",
+    "labels",
+    "lag",
+    "laggedstart",
+    "left",
+    "line",
+    "mobject",
+    "move",
+    "next",
+    "opacity",
+    "orange",
+    "origin",
+    "play",
+    "point",
+    "purple",
+    "radius",
+    "rectangle",
+    "red",
+    "right",
+    "roundedrectangle",
+    "scale",
+    "scene",
+    "segment",
+    "self",
+    "shift",
+    "size",
+    "square",
+    "start",
+    "stroke",
+    "text",
+    "title",
+    "up",
+    "vgroup",
+    "white",
+    "width",
+    "write",
+    "yellow",
 }
 ASSET_ROUTE_PREFIX = "/render-assets"
 ASSET_ROUTE_TOKEN = secrets.token_urlsafe(18)
@@ -1202,6 +1329,238 @@ class _NarrationTimelineUsageVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _normalize_term(term: str) -> str | None:
+    cleaned = term.lower().strip("_-'")
+    if not cleaned or cleaned in TERM_STOPWORDS or cleaned in VISUAL_TERM_IGNORE:
+        return None
+    if len(cleaned) < 3 and not cleaned.isdigit():
+        return None
+    if cleaned.endswith("'s"):
+        cleaned = cleaned[:-2]
+    if len(cleaned) > 5 and cleaned.endswith("ies"):
+        cleaned = f"{cleaned[:-3]}y"
+    elif len(cleaned) > 6 and cleaned.endswith("ing"):
+        cleaned = cleaned[:-3]
+    elif len(cleaned) > 5 and cleaned.endswith("es"):
+        cleaned = cleaned[:-2]
+    elif len(cleaned) > 4 and cleaned.endswith("s"):
+        cleaned = cleaned[:-1]
+    if cleaned in TERM_STOPWORDS or cleaned in VISUAL_TERM_IGNORE:
+        return None
+    return cleaned
+
+
+def _term_tokens(text: str, *, ignore_visual_boilerplate: bool = False) -> set[str]:
+    ignored = VISUAL_TERM_IGNORE if ignore_visual_boilerplate else TERM_STOPWORDS
+    tokens: set[str] = set()
+    for raw in WORD_RE.findall(text):
+        token = _normalize_term(raw)
+        if token and token not in ignored:
+            tokens.add(token)
+    return tokens
+
+
+def _identifier_terms(name: str) -> set[str]:
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name.replace("_", " "))
+    return _term_tokens(spaced, ignore_visual_boilerplate=True)
+
+
+class _VisualTermVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.string_tokens: set[str] = set()
+        self.identifier_tokens: set[str] = set()
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str):
+            self.string_tokens.update(_term_tokens(node.value, ignore_visual_boilerplate=True))
+
+    def visit_Name(self, node: ast.Name) -> None:
+        self.identifier_tokens.update(_identifier_terms(node.id))
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        self.identifier_tokens.update(_identifier_terms(node.attr))
+        self.generic_visit(node)
+
+
+def _visual_terms_for_nodes(nodes: list[ast.AST]) -> dict[str, Any]:
+    visitor = _VisualTermVisitor()
+    for node in nodes:
+        visitor.visit(node)
+    visual_tokens = sorted(visitor.string_tokens | visitor.identifier_tokens)
+    return {
+        "string_terms": sorted(visitor.string_tokens),
+        "identifier_terms": sorted(visitor.identifier_tokens),
+        "terms": visual_tokens,
+    }
+
+
+def _timeline_segment_call_infos(node: ast.AST) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        if not isinstance(child.func, ast.Attribute):
+            continue
+        method = child.func.attr
+        if method not in TIMELINE_SEGMENT_METHODS:
+            continue
+        if not child.args:
+            continue
+        index_node = child.args[0]
+        if not isinstance(index_node, ast.Constant) or not isinstance(index_node.value, int):
+            continue
+        calls.append(
+            {
+                "method": method,
+                "segment_index": index_node.value,
+                "line": getattr(child, "lineno", None),
+            }
+        )
+    calls.sort(key=lambda item: item["line"] or 0)
+    return calls
+
+
+def analyze_timeline_visual_alignment(
+    tree: ast.Module,
+    scene_name: str,
+    timing_plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Statically compare explicit timeline visual beats with narration text."""
+    construct = _target_construct_function(tree, scene_name)
+    segments = timing_plan.get("segments") or []
+    if construct is None or not segments:
+        return {"checked": False, "issues": []}
+
+    narration_tokens = [
+        _term_tokens(str(segment.get("text", "")), ignore_visual_boilerplate=False)
+        for segment in segments
+    ]
+    beats: list[dict[str, Any]] = []
+    chunk: list[ast.AST] = []
+    for statement in construct.body:
+        chunk.append(statement)
+        segment_calls = _timeline_segment_call_infos(statement)
+        if not segment_calls:
+            continue
+        terms = _visual_terms_for_nodes(chunk)
+        for call in segment_calls:
+            if call["method"] != "play_segment":
+                continue
+            index = int(call["segment_index"])
+            if index < 0 or index >= len(segments):
+                continue
+            beat_terms = set(terms["string_terms"] or terms["terms"])
+            current_overlap = sorted(beat_terms & narration_tokens[index])
+            previous_overlap = (
+                sorted(beat_terms & narration_tokens[index - 1]) if index > 0 else []
+            )
+            next_overlap = (
+                sorted(beat_terms & narration_tokens[index + 1])
+                if index + 1 < len(narration_tokens)
+                else []
+            )
+            beats.append(
+                {
+                    "segment_index": index,
+                    "line": call["line"],
+                    "string_term_count": len(terms["string_terms"]),
+                    "visual_terms": sorted(beat_terms)[:24],
+                    "narration_terms": sorted(narration_tokens[index])[:24],
+                    "overlap_terms": current_overlap[:12],
+                    "overlap_count": len(current_overlap),
+                    "previous_overlap_count": len(previous_overlap),
+                    "next_overlap_count": len(next_overlap),
+                    "next_overlap_terms": next_overlap[:12],
+                    "previous_overlap_terms": previous_overlap[:12],
+                }
+            )
+        chunk = []
+
+    issues: list[dict[str, Any]] = []
+    for beat in beats:
+        index = int(beat["segment_index"])
+        visual_terms = beat["visual_terms"]
+        current_overlap_count = int(beat["overlap_count"])
+        previous_overlap_count = int(beat["previous_overlap_count"])
+        next_overlap_count = int(beat["next_overlap_count"])
+
+        if (
+            next_overlap_count >= current_overlap_count + 2
+            and next_overlap_count >= 2
+            and index + 1 < len(segments)
+        ):
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "timeline_visual_appears_early",
+                    "segment_index": index,
+                    "line": beat["line"],
+                    "message": (
+                        f"Timeline segment {index} visually matches narration segment {index + 1} "
+                        "better than its own sentence. Move that animation to the sentence that "
+                        "describes it, or rewrite the narration so segment text and visuals match."
+                    ),
+                    "visual_terms": visual_terms[:12],
+                    "current_overlap_terms": beat["overlap_terms"],
+                    "next_overlap_terms": beat["next_overlap_terms"],
+                }
+            )
+            continue
+
+        if (
+            previous_overlap_count >= current_overlap_count + 2
+            and previous_overlap_count >= 2
+            and index > 0
+        ):
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "timeline_visual_appears_late",
+                    "segment_index": index,
+                    "line": beat["line"],
+                    "message": (
+                        f"Timeline segment {index} visually matches narration segment {index - 1} "
+                        "better than its own sentence. Bind each visual beat to the narration "
+                        "sentence currently being spoken."
+                    ),
+                    "visual_terms": visual_terms[:12],
+                    "current_overlap_terms": beat["overlap_terms"],
+                    "previous_overlap_terms": beat["previous_overlap_terms"],
+                }
+            )
+            continue
+
+        if (
+            current_overlap_count < 2
+            and int(beat["string_term_count"]) >= 4
+            and len(visual_terms) >= 4
+            and len(beat["narration_terms"]) >= 5
+        ):
+            issues.append(
+                {
+                    "severity": "warning",
+                    "code": "low_visual_narration_overlap",
+                    "segment_index": index,
+                    "line": beat["line"],
+                    "message": (
+                        f"Timeline segment {index} has little textual overlap between its "
+                        "visual terms and narration. This may be fine for abstract motion, "
+                        "but check that the animation depicts the sentence being spoken."
+                    ),
+                    "visual_terms": visual_terms[:12],
+                    "narration_terms": beat["narration_terms"][:12],
+                    "overlap_terms": beat["overlap_terms"],
+                }
+            )
+
+    return {
+        "checked": True,
+        "beat_count": len(beats),
+        "issues": issues,
+        "beats": beats,
+    }
+
+
 def _reserved_user_name(name: str) -> str:
     return f"_manim_mcp_user_{name}"
 
@@ -1474,12 +1833,150 @@ def _manim_mcp_next_duration(default=1.0):
         return fallback
 
 
+MANIM_MCP_TIMELINE_EVENTS = []
+MANIM_MCP_OUTSIDE_TIMED_EVENTS = []
+MANIM_MCP_IN_TIMELINE_CALL = 0
+MANIM_MCP_IN_OUTSIDE_WAIT = 0
+
+
+def _manim_mcp_scene_time(scene):
+    try:
+        return float(getattr(scene, "time", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _manim_mcp_json_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        return float(value)
+    except Exception:
+        return repr(value)
+
+
+def _manim_mcp_record_event(collection, event):
+    try:
+        event["start_seconds"] = round(float(event.get("start_seconds", 0.0)), 3)
+        event["end_seconds"] = round(float(event.get("end_seconds", 0.0)), 3)
+        event["actual_seconds"] = round(
+            max(0.0, event["end_seconds"] - event["start_seconds"]),
+            3,
+        )
+    except Exception:
+        pass
+    collection.append(event)
+
+
+def _manim_mcp_patch_scene_instance(scene):
+    if getattr(scene, "_manim_mcp_methods_patched", False):
+        return
+
+    original_play = scene.play
+    original_wait = scene.wait
+
+    def play_wrapper(*args, **kwargs):
+        if MANIM_MCP_IN_TIMELINE_CALL or MANIM_MCP_IN_OUTSIDE_WAIT:
+            return original_play(*args, **kwargs)
+        start = _manim_mcp_scene_time(scene)
+        result = original_play(*args, **kwargs)
+        end = _manim_mcp_scene_time(scene)
+        _manim_mcp_record_event(
+            MANIM_MCP_OUTSIDE_TIMED_EVENTS,
+            dict(
+                kind="play",
+                line=None,
+                animation_count=len(args),
+                requested_run_time=_manim_mcp_json_value(kwargs.get("run_time")),
+                start_seconds=start,
+                end_seconds=end,
+            ),
+        )
+        return result
+
+    def wait_wrapper(*args, **kwargs):
+        global MANIM_MCP_IN_OUTSIDE_WAIT
+        if MANIM_MCP_IN_TIMELINE_CALL:
+            return original_wait(*args, **kwargs)
+        start = _manim_mcp_scene_time(scene)
+        MANIM_MCP_IN_OUTSIDE_WAIT += 1
+        try:
+            result = original_wait(*args, **kwargs)
+        finally:
+            MANIM_MCP_IN_OUTSIDE_WAIT -= 1
+        end = _manim_mcp_scene_time(scene)
+        requested = args[0] if args else kwargs.get("duration")
+        _manim_mcp_record_event(
+            MANIM_MCP_OUTSIDE_TIMED_EVENTS,
+            dict(
+                kind="wait",
+                line=None,
+                requested_duration=_manim_mcp_json_value(requested),
+                start_seconds=start,
+                end_seconds=end,
+            ),
+        )
+        return result
+
+    scene.play = play_wrapper
+    scene.wait = wait_wrapper
+    scene._manim_mcp_methods_patched = True
+
+
+def _manim_mcp_write_timeline_events():
+    try:
+        import json as _manim_mcp_json
+        import os as _manim_mcp_os
+
+        job_dir = _manim_mcp_os.environ.get("MANIM_MCP_JOB_DIR")
+        if not job_dir:
+            return
+        narration_dir = _manim_mcp_os.path.join(job_dir, "narration")
+        _manim_mcp_os.makedirs(narration_dir, exist_ok=True)
+        path = _manim_mcp_os.path.join(narration_dir, "timeline_actual.json")
+        all_events = MANIM_MCP_TIMELINE_EVENTS + MANIM_MCP_OUTSIDE_TIMED_EVENTS
+        payload = dict(
+            timing_source="manim_scene_time",
+            segment_count=len(NARRATION_TIMING.get("segments", [])),
+            timeline_events=MANIM_MCP_TIMELINE_EVENTS,
+            outside_timed_events=MANIM_MCP_OUTSIDE_TIMED_EVENTS,
+            timeline_event_count=len(MANIM_MCP_TIMELINE_EVENTS),
+            outside_timed_event_count=len(MANIM_MCP_OUTSIDE_TIMED_EVENTS),
+            timeline_total_seconds=round(
+                sum(float(event.get("actual_seconds", 0.0)) for event in MANIM_MCP_TIMELINE_EVENTS),
+                3,
+            ),
+            outside_timed_total_seconds=round(
+                sum(float(event.get("actual_seconds", 0.0)) for event in MANIM_MCP_OUTSIDE_TIMED_EVENTS),
+                3,
+            ),
+            scene_time_seconds=round(
+                max([float(event.get("end_seconds", 0.0)) for event in all_events] or [0.0]),
+                3,
+            ),
+        )
+        with open(path, "w", encoding="utf-8") as file:
+            _manim_mcp_json.dump(payload, file, indent=2)
+            file.write("\\n")
+    except Exception:
+        return
+
+
+try:
+    import atexit as _manim_mcp_atexit
+
+    _manim_mcp_atexit.register(_manim_mcp_write_timeline_events)
+except Exception:
+    pass
+
+
 class NarrationTimeline:
     """Small helper injected by manim_mcp for narrated scenes."""
 
     def __init__(self, scene, plan=None):
         self.scene = scene
         self.plan = plan or NARRATION_TIMING
+        _manim_mcp_patch_scene_instance(scene)
 
     def segment(self, index):
         try:
@@ -1495,16 +1992,63 @@ class NarrationTimeline:
         return max(minimum, float(self.segment(index)["duration_seconds"]))
 
     def play_segment(self, index, *animations, hold=0.0, **kwargs):
+        global MANIM_MCP_IN_TIMELINE_CALL
+        segment = self.segment(index)
+        target_duration = max(0.05, float(segment["duration_seconds"]))
         run_time = max(0.05, self.duration(index) - max(0.0, hold))
-        if animations:
-            self.scene.play(*animations, run_time=run_time, **kwargs)
-        else:
-            self.scene.wait(run_time)
-        if hold > 0:
-            self.scene.wait(hold)
+        start = _manim_mcp_scene_time(self.scene)
+        MANIM_MCP_IN_TIMELINE_CALL += 1
+        try:
+            if animations:
+                self.scene.play(*animations, run_time=run_time, **kwargs)
+            else:
+                self.scene.wait(run_time)
+            if hold > 0:
+                self.scene.wait(hold)
+        finally:
+            MANIM_MCP_IN_TIMELINE_CALL -= 1
+        end = _manim_mcp_scene_time(self.scene)
+        _manim_mcp_record_event(
+            MANIM_MCP_TIMELINE_EVENTS,
+            dict(
+                kind="play_segment",
+                segment_index=segment.get("index", index),
+                out_of_range=bool(segment.get("out_of_range")),
+                segment_text=segment.get("text", ""),
+                target_duration_seconds=target_duration,
+                requested_run_time=run_time,
+                hold_seconds=max(0.0, hold),
+                animation_count=len(animations),
+                start_seconds=start,
+                end_seconds=end,
+            ),
+        )
 
     def wait_segment(self, index, *, scale=1.0):
-        self.scene.wait(max(0.05, self.duration(index) * scale))
+        global MANIM_MCP_IN_TIMELINE_CALL
+        segment = self.segment(index)
+        target_duration = max(0.05, self.duration(index) * scale)
+        start = _manim_mcp_scene_time(self.scene)
+        MANIM_MCP_IN_TIMELINE_CALL += 1
+        try:
+            self.scene.wait(target_duration)
+        finally:
+            MANIM_MCP_IN_TIMELINE_CALL -= 1
+        end = _manim_mcp_scene_time(self.scene)
+        _manim_mcp_record_event(
+            MANIM_MCP_TIMELINE_EVENTS,
+            dict(
+                kind="wait_segment",
+                segment_index=segment.get("index", index),
+                out_of_range=bool(segment.get("out_of_range")),
+                segment_text=segment.get("text", ""),
+                target_duration_seconds=target_duration,
+                requested_scale=scale,
+                animation_count=0,
+                start_seconds=start,
+                end_seconds=end,
+            ),
+        )
 
 
 def narration_timeline(scene):
@@ -1636,6 +2180,11 @@ def prepare_narrated_scene_code(
         report["explicit_timeline_coverage_ratio"] = (
             round(len(set(covered_indices)) / segment_count, 3) if segment_count else 1.0
         )
+        report["timeline_alignment"] = analyze_timeline_visual_alignment(
+            tree,
+            scene_name,
+            timing_plan,
+        )
 
     if construct is None:
         report["warning"] = f"Could not find construct() for scene {scene_name!r}; using global video fit only."
@@ -1651,7 +2200,12 @@ def prepare_narrated_scene_code(
 
     if report["explicit_timeline_used"]:
         if collector.calls or collector.dynamic_loop_timed_calls:
+            outside_timeline_seconds = round(
+                sum(max(float(call.get("weight", 1.0)), 0.05) for call in collector.calls),
+                3,
+            )
             report["outside_timeline_timed_call_count"] = len(collector.calls)
+            report["outside_timeline_estimated_seconds"] = outside_timeline_seconds
             report["warning"] = (
                 "Scene uses narration_timeline(...); ordinary self.play/self.wait calls "
                 "were left unchanged. Keep those calls short or move them into "
@@ -1946,6 +2500,140 @@ def concatenate_audio_segments(
     }
 
 
+def align_segmented_audio_to_timeline(
+    audio: dict[str, Any],
+    timeline_actual: dict[str, Any],
+    output_path: Path,
+    *,
+    timeout_seconds: int = 300,
+) -> dict[str, Any]:
+    """Place each spoken segment at its actual rendered timeline start."""
+    segment_infos = audio.get("segments") or []
+    timeline_events = timeline_actual.get("timeline_events") or []
+    if not segment_infos or not timeline_events:
+        return audio
+
+    ffmpeg = shutil.which("ffmpeg", path=_tool_env().get("PATH"))
+    if not ffmpeg:
+        raise ValueError("ffmpeg is required to align narration audio to timeline events.")
+
+    starts: dict[int, float] = {}
+    for event in timeline_events:
+        if event.get("out_of_range"):
+            continue
+        index = event.get("segment_index")
+        start = event.get("start_seconds")
+        if not isinstance(index, int) or not isinstance(start, int | float):
+            continue
+        starts[index] = min(starts.get(index, float(start)), float(start))
+
+    if not starts:
+        return audio
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [ffmpeg, "-y"]
+    input_labels: list[str] = []
+    silence_gaps: list[dict[str, Any]] = []
+    cursor = 0.0
+    input_index = 0
+
+    for segment in sorted(segment_infos, key=lambda item: int(item.get("index", 0))):
+        index = int(segment.get("index", 0))
+        segment_path = Path(segment["path"])
+        segment_duration = float(segment.get("duration_seconds") or 0.0)
+        start = max(0.0, float(starts.get(index, cursor)))
+        gap = max(0.0, start - cursor)
+        if gap > 0.02:
+            command.extend(
+                [
+                    "-f",
+                    "lavfi",
+                    "-t",
+                    f"{gap:.3f}",
+                    "-i",
+                    "anullsrc=r=24000:cl=mono",
+                ]
+            )
+            input_labels.append(f"[{input_index}:a:0]")
+            silence_gaps.append(
+                {
+                    "before_segment_index": index,
+                    "duration_seconds": round(gap, 3),
+                    "start_seconds": round(cursor, 3),
+                    "end_seconds": round(start, 3),
+                }
+            )
+            input_index += 1
+            cursor = start
+
+        command.extend(["-i", str(segment_path)])
+        input_labels.append(f"[{input_index}:a:0]")
+        input_index += 1
+        cursor = max(cursor, start) + max(segment_duration, 0.0)
+
+    if not input_labels:
+        return audio
+
+    command.extend(
+        [
+            "-filter_complex",
+            f"{''.join(input_labels)}concat=n={len(input_labels)}:v=0:a=1[a]",
+            "-map",
+            "[a]",
+            "-ar",
+            "24000",
+            "-ac",
+            "1",
+            str(output_path),
+        ]
+    )
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        shell=False,
+        env=_tool_env(),
+    )
+    if completed.returncode != 0:
+        raise ValueError(f"ffmpeg timeline audio alignment failed: {_tail(completed.stderr, 2000)}")
+
+    output_duration = probe_media_duration(output_path)
+    output_streams = probe_media_streams(output_path)
+    output_audio_streams = [
+        stream for stream in output_streams or [] if stream.get("codec_type") == "audio"
+    ]
+    if output_streams is not None and not output_audio_streams:
+        raise ValueError("Timeline-aligned narration file does not contain an audio stream.")
+
+    aligned = dict(audio)
+    aligned.update(
+        {
+            "path": str(output_path.resolve()),
+            "uri": output_path.resolve().as_uri(),
+            "source_path": audio.get("path"),
+            "source_uri": audio.get("uri"),
+            "timeline_aligned": True,
+            "timeline_alignment_source": "manim_scene_time",
+            "timeline_silence_gaps": silence_gaps,
+            "timeline_silence_gap_count": len(silence_gaps),
+            "timeline_silence_total_seconds": round(
+                sum(gap["duration_seconds"] for gap in silence_gaps),
+                3,
+            ),
+            "size_bytes": output_path.stat().st_size,
+            "duration_seconds": output_duration or round(cursor, 3),
+            "audio_stream_count": len(output_audio_streams)
+            if output_streams is not None
+            else None,
+            "alignment_command": command,
+            "alignment_stdout_tail": _tail(completed.stdout),
+            "alignment_stderr_tail": _tail(completed.stderr),
+        }
+    )
+    return aligned
+
+
 def synthesize_segmented_narration_audio(
     text: str,
     narration_dir: Path,
@@ -2027,6 +2715,123 @@ def synthesize_segmented_narration_audio(
         "concat_stderr_tail": concat_info["stderr_tail"],
     }
     return audio, timing_plan
+
+
+def _prepared_narration_path(prepared_narration_id: str) -> Path:
+    if not JOB_ID_RE.match(prepared_narration_id):
+        raise ValueError("prepared_narration_id is not valid.")
+    root = PREPARED_NARRATION_ROOT.resolve()
+    path = (PREPARED_NARRATION_ROOT / prepared_narration_id).resolve()
+    if path != root and root not in path.parents:
+        raise ValueError("prepared_narration_id resolved outside prepared narration root.")
+    return path
+
+
+def prepare_narration_metadata(
+    narration_text: str,
+    *,
+    narration_model: str = DEFAULT_NARRATION_MODEL,
+    narration_provider: str = DEFAULT_NARRATION_PROVIDER,
+    narration_tts_timeout_seconds: int = 120,
+    narration_mux_timeout_seconds: int = 300,
+    narration_audio_mode: NarrationAudioMode = "segmented",
+) -> dict[str, Any]:
+    """Generate narration audio and measured timings without rendering a scene."""
+    text = narration_text.strip()
+    if not text:
+        raise ValueError("narration_text must not be empty.")
+    if narration_audio_mode not in {"segmented", "single"}:
+        raise ValueError("narration_audio_mode must be one of: segmented, single.")
+
+    prepared_id = _new_job_id()
+    narration_dir = PREPARED_NARRATION_ROOT / prepared_id
+    audio_dir = narration_dir / "audio"
+    narration_dir.mkdir(parents=True, exist_ok=False)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = narration_dir / "metadata.json"
+    timing_path = narration_dir / "timing_plan.json"
+    started = time.monotonic()
+
+    metadata: dict[str, Any] = {
+        "success": False,
+        "prepared_narration_id": prepared_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "narration_text": text,
+        "narration_text_chars": len(text),
+        "narration_model": narration_model,
+        "narration_provider": narration_provider,
+        "narration_tts_backend": narration_tts_backend(narration_provider),
+        "narration_audio_mode": narration_audio_mode,
+        "prepared_narration_dir": str(narration_dir.resolve()),
+        "timing_path": str(timing_path.resolve()),
+    }
+
+    try:
+        if narration_audio_mode == "segmented":
+            audio, timing_plan = synthesize_segmented_narration_audio(
+                text,
+                audio_dir,
+                model=narration_model,
+                provider=narration_provider,
+                timeout_seconds=narration_tts_timeout_seconds,
+                concat_timeout_seconds=narration_mux_timeout_seconds,
+            )
+        else:
+            output_path = audio_dir / "narration.wav"
+            audio = synthesize_narration_audio(
+                text,
+                output_path,
+                model=narration_model,
+                provider=narration_provider,
+                timeout_seconds=narration_tts_timeout_seconds,
+            )
+            timing_plan = build_narration_timing_plan(
+                text,
+                total_duration_seconds=audio.get("duration_seconds"),
+            )
+        timing_path.write_text(json.dumps(timing_plan, indent=2) + "\n", encoding="utf-8")
+        metadata.update(
+            {
+                "success": True,
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "audio": audio,
+                "timing_plan": timing_plan,
+                "usage": (
+                    "Use this prepared_narration_id with render_scene_with_prepared_narration. "
+                    "Write one coherent Manim Scene, use the returned segment durations to pace "
+                    "visual beats, and let the server mux the prepared audio."
+                ),
+            }
+        )
+    except Exception as exc:
+        metadata.update(
+            {
+                "success": False,
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return metadata
+
+
+def load_prepared_narration(prepared_narration_id: str) -> dict[str, Any]:
+    narration_dir = _prepared_narration_path(prepared_narration_id)
+    metadata_path = narration_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise ValueError(f"Prepared narration {prepared_narration_id!r} was not found.")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Prepared narration {prepared_narration_id!r} metadata is invalid.") from exc
+    if not metadata.get("success"):
+        raise ValueError(
+            f"Prepared narration {prepared_narration_id!r} is not usable: "
+            f"{metadata.get('error') or 'preparation failed'}"
+        )
+    if not metadata.get("audio") or not metadata.get("timing_plan"):
+        raise ValueError(f"Prepared narration {prepared_narration_id!r} is missing audio or timing data.")
+    return metadata
 
 
 def probe_media_duration(path: Path, timeout_seconds: int = 30) -> float | None:
@@ -2125,7 +2930,7 @@ def mux_narration_audio(
         )
 
     if (
-        sync_mode in {"timeline", "fit"}
+        sync_mode == "fit"
         and video_duration is not None
         and audio_duration is not None
         and video_duration > 0
@@ -2450,11 +3255,82 @@ def analyze_video_frame_bounds(
     }
 
 
+def load_narration_timeline_actual(
+    job_dir: Path,
+    timing_plan: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    path = job_dir / "narration" / "timeline_actual.json"
+    if not path.exists():
+        return None
+    try:
+        actual = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    actual["path"] = str(path.resolve())
+    actual["uri"] = path.resolve().as_uri()
+    segments = (timing_plan or {}).get("segments") or []
+    by_index = {
+        int(segment["index"]): segment
+        for segment in segments
+        if isinstance(segment, dict) and isinstance(segment.get("index"), int)
+    }
+    enriched_events: list[dict[str, Any]] = []
+    max_abs_start_delta = 0.0
+    max_abs_end_delta = 0.0
+    worst_start_event: dict[str, Any] | None = None
+    worst_end_event: dict[str, Any] | None = None
+
+    for event in actual.get("timeline_events") or []:
+        enriched = dict(event)
+        index = event.get("segment_index")
+        segment = by_index.get(index) if isinstance(index, int) else None
+        if segment:
+            planned_start = float(segment.get("start_seconds") or 0.0)
+            planned_end = float(segment.get("end_seconds") or planned_start)
+            actual_start = float(event.get("start_seconds") or 0.0)
+            actual_end = float(event.get("end_seconds") or actual_start)
+            start_delta = round(actual_start - planned_start, 3)
+            end_delta = round(actual_end - planned_end, 3)
+            duration_delta = round(
+                float(event.get("actual_seconds") or 0.0)
+                - float(segment.get("duration_seconds") or 0.0),
+                3,
+            )
+            enriched.update(
+                {
+                    "planned_start_seconds": round(planned_start, 3),
+                    "planned_end_seconds": round(planned_end, 3),
+                    "start_delta_seconds": start_delta,
+                    "end_delta_seconds": end_delta,
+                    "duration_delta_seconds": duration_delta,
+                }
+            )
+            if abs(start_delta) > max_abs_start_delta:
+                max_abs_start_delta = abs(start_delta)
+                worst_start_event = enriched
+            if abs(end_delta) > max_abs_end_delta:
+                max_abs_end_delta = abs(end_delta)
+                worst_end_event = enriched
+        enriched_events.append(enriched)
+
+    actual["timeline_events"] = enriched_events
+    actual["sync_summary"] = {
+        "max_abs_start_delta_seconds": round(max_abs_start_delta, 3),
+        "max_abs_end_delta_seconds": round(max_abs_end_delta, 3),
+        "worst_start_event": worst_start_event,
+        "worst_end_event": worst_end_event,
+    }
+    return actual
+
+
 def analyze_render_quality(metadata: dict[str, Any], *, visual_checks: bool = True) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
 
     narration_video = (metadata.get("narration") or {}).get("video") or {}
+    narration_audio = (metadata.get("narration") or {}).get("audio") or {}
     narration_sync = metadata.get("narration_sync") or {}
+    timeline_actual = metadata.get("narration_timeline_actual") or {}
     if metadata.get("narration_requested"):
         dynamic_loop_calls = int(narration_sync.get("dynamic_loop_timed_call_count") or 0)
         explicit_timeline = bool(narration_sync.get("explicit_timeline_used"))
@@ -2476,9 +3352,68 @@ def analyze_render_quality(metadata: dict[str, Any], *, visual_checks: bool = Tr
             covered_count = int(narration_sync.get("explicit_timeline_covered_segment_count") or 0)
             missing_segments = narration_sync.get("explicit_timeline_missing_segments") or []
             out_of_range_segments = narration_sync.get("explicit_timeline_out_of_range_segments") or []
+            outside_timeline_calls = int(
+                timeline_actual.get("outside_timed_event_count")
+                if timeline_actual.get("outside_timed_event_count") is not None
+                else narration_sync.get("outside_timeline_timed_call_count")
+                or 0
+            )
+            outside_timeline_seconds = float(
+                timeline_actual.get("outside_timed_total_seconds")
+                if timeline_actual.get("outside_timed_total_seconds") is not None
+                else narration_sync.get("outside_timeline_estimated_seconds")
+                or 0.0
+            )
             dynamic_segment_calls = int(
                 narration_sync.get("explicit_timeline_dynamic_segment_call_count") or 0
             )
+            if outside_timeline_calls:
+                audio_timeline_aligned = bool(narration_audio.get("timeline_aligned"))
+                severity = (
+                    "warning"
+                    if audio_timeline_aligned
+                    else "error"
+                    if outside_timeline_seconds > 1.5 or outside_timeline_calls > 2
+                    else "warning"
+                )
+                issues.append(
+                    {
+                        "severity": severity,
+                        "code": "outside_timeline_timed_calls",
+                        "message": (
+                            f"{outside_timeline_calls} timed self.play/self.wait calls "
+                            f"({outside_timeline_seconds:.2f}s measured) are outside "
+                            "tl.play_segment(...) / tl.wait_segment(...). Timeline audio "
+                            "can insert silence for transition gaps, but important visual "
+                            "motion should live inside the narration segment that explains it."
+                        ),
+                        "outside_timeline_timed_call_count": outside_timeline_calls,
+                        "outside_timeline_estimated_seconds": outside_timeline_seconds,
+                        "measured_from_render": bool(timeline_actual),
+                        "timeline_audio_aligned": audio_timeline_aligned,
+                    }
+                )
+            sync_summary = timeline_actual.get("sync_summary") or {}
+            max_start_delta = float(sync_summary.get("max_abs_start_delta_seconds") or 0.0)
+            if max_start_delta > 0.75:
+                worst_event = sync_summary.get("worst_start_event") or {}
+                audio_timeline_aligned = bool(narration_audio.get("timeline_aligned"))
+                issues.append(
+                    {
+                        "severity": "warning" if audio_timeline_aligned else "error",
+                        "code": "actual_timeline_start_drift",
+                        "message": (
+                            f"Measured render timing drifted by up to {max_start_delta:.2f}s "
+                            "from the initial narration plan. Timeline-aligned audio can follow "
+                            "those rendered starts, but large gaps may feel slow unless they are "
+                            "intentional pauses."
+                        ),
+                        "max_abs_start_delta_seconds": round(max_start_delta, 3),
+                        "segment_index": worst_event.get("segment_index"),
+                        "start_delta_seconds": worst_event.get("start_delta_seconds"),
+                        "timeline_audio_aligned": audio_timeline_aligned,
+                    }
+                )
             if segment_count and covered_count < segment_count and not dynamic_segment_calls:
                 issues.append(
                     {
@@ -2507,6 +3442,27 @@ def analyze_render_quality(metadata: dict[str, Any], *, visual_checks: bool = Tr
                         ),
                         "segment_count": segment_count,
                         "out_of_range_segments": out_of_range_segments,
+                    }
+                )
+            alignment = narration_sync.get("timeline_alignment") or {}
+            for alignment_issue in alignment.get("issues") or []:
+                severity = alignment_issue.get("severity")
+                if severity not in {"error", "warning"}:
+                    severity = "warning"
+                issues.append(
+                    {
+                        "severity": severity,
+                        "code": alignment_issue.get("code", "timeline_visual_alignment"),
+                        "message": alignment_issue.get(
+                            "message",
+                            "A timeline visual beat may not match its narration sentence.",
+                        ),
+                        "segment_index": alignment_issue.get("segment_index"),
+                        "line": alignment_issue.get("line"),
+                        "visual_terms": alignment_issue.get("visual_terms"),
+                        "current_overlap_terms": alignment_issue.get("current_overlap_terms"),
+                        "next_overlap_terms": alignment_issue.get("next_overlap_terms"),
+                        "previous_overlap_terms": alignment_issue.get("previous_overlap_terms"),
                     }
                 )
 
@@ -2611,6 +3567,18 @@ def add_narration_to_render(
             provider=provider,
             timeout_seconds=tts_timeout_seconds,
         )
+    if (
+        sync_mode == "timeline"
+        and audio.get("audio_mode") == "segmented"
+        and metadata.get("narration_timeline_actual")
+    ):
+        audio = align_segmented_audio_to_timeline(
+            audio,
+            metadata["narration_timeline_actual"],
+            narration_dir / "narration.timeline.wav",
+            timeout_seconds=mux_timeout_seconds,
+        )
+    metadata["narration_audio"] = audio
     muxed_video = mux_narration_audio(
         original_video_path,
         Path(audio["path"]),
@@ -3140,6 +4108,7 @@ def _render_scene_metadata(
     save_last_frame: bool = False,
     timeout_seconds: int = 120,
     narration_text: str | None = None,
+    prepared_narration_id: str | None = None,
     narration_model: str = DEFAULT_NARRATION_MODEL,
     narration_provider: str = DEFAULT_NARRATION_PROVIDER,
     narration_tts_timeout_seconds: int = 120,
@@ -3150,6 +4119,8 @@ def _render_scene_metadata(
     fail_on_quality_issues: bool = False,
 ) -> dict[str, Any]:
     started = time.monotonic()
+    prepared_narration: dict[str, Any] | None = None
+    resolved_narration_text = narration_text.strip() if narration_text else None
     try:
         if not code.strip():
             raise ValueError("code must not be empty.")
@@ -3160,8 +4131,16 @@ def _render_scene_metadata(
             raise ValueError("narration_sync_mode must be one of: timeline, fit, pad.")
         if narration_audio_mode not in {"segmented", "single"}:
             raise ValueError("narration_audio_mode must be one of: segmented, single.")
-        if narration_text and output_format != "mp4":
-            raise ValueError("narration_text currently requires output_format='mp4'.")
+        if narration_text and prepared_narration_id:
+            raise ValueError("Use either narration_text or prepared_narration_id, not both.")
+        if prepared_narration_id:
+            prepared_narration = load_prepared_narration(prepared_narration_id)
+            resolved_narration_text = prepared_narration["narration_text"]
+            narration_audio_mode = prepared_narration.get("narration_audio_mode", narration_audio_mode)
+            narration_model = prepared_narration.get("narration_model", narration_model)
+            narration_provider = prepared_narration.get("narration_provider", narration_provider)
+        if resolved_narration_text and output_format != "mp4":
+            raise ValueError("Narration currently requires output_format='mp4'.")
 
         violations = analyze_code_safety(code)
         if violations:
@@ -3219,13 +4198,14 @@ def _render_scene_metadata(
         "format": output_format,
         "save_last_frame": save_last_frame,
         "timeout_seconds": timeout_seconds,
-        "narration_requested": bool(narration_text),
-        "narration_text_chars": len(narration_text.strip()) if narration_text else 0,
-        "narration_model": narration_model if narration_text else None,
-        "narration_provider": narration_provider if narration_text else None,
-        "narration_tts_backend": narration_tts_backend(narration_provider) if narration_text else None,
-        "narration_sync_mode": narration_sync_mode if narration_text else None,
-        "narration_audio_mode": narration_audio_mode if narration_text else None,
+        "narration_requested": bool(resolved_narration_text),
+        "narration_text_chars": len(resolved_narration_text) if resolved_narration_text else 0,
+        "prepared_narration_id": prepared_narration_id,
+        "narration_model": narration_model if resolved_narration_text else None,
+        "narration_provider": narration_provider if resolved_narration_text else None,
+        "narration_tts_backend": narration_tts_backend(narration_provider) if resolved_narration_text else None,
+        "narration_sync_mode": narration_sync_mode if resolved_narration_text else None,
+        "narration_audio_mode": narration_audio_mode if resolved_narration_text else None,
         "job_dir": str(job_dir.resolve()),
         "script_path": str(script_path.resolve()),
         "media_dir": str(media_dir.resolve()),
@@ -3238,14 +4218,23 @@ def _render_scene_metadata(
     render_code = code
     pre_render_audio: dict[str, Any] | None = None
     pre_render_audio_path: Path | None = None
-    if narration_text:
+    if resolved_narration_text:
         try:
             narration_dir = job_dir / "narration"
             narration_dir.mkdir(parents=True, exist_ok=True)
             pre_render_audio_path = narration_dir / "narration.wav"
-            if narration_audio_mode == "segmented":
+            if prepared_narration:
+                pre_render_audio = prepared_narration["audio"]
+                pre_render_audio_path = Path(pre_render_audio["path"])
+                timing_plan = prepared_narration["timing_plan"]
+                metadata["prepared_narration"] = {
+                    "prepared_narration_id": prepared_narration["prepared_narration_id"],
+                    "prepared_narration_dir": prepared_narration["prepared_narration_dir"],
+                    "timing_path": prepared_narration["timing_path"],
+                }
+            elif narration_audio_mode == "segmented":
                 pre_render_audio, timing_plan = synthesize_segmented_narration_audio(
-                    narration_text,
+                    resolved_narration_text,
                     narration_dir,
                     model=narration_model,
                     provider=narration_provider,
@@ -3255,14 +4244,14 @@ def _render_scene_metadata(
                 pre_render_audio_path = Path(pre_render_audio["path"])
             else:
                 pre_render_audio = synthesize_narration_audio(
-                    narration_text,
+                    resolved_narration_text,
                     pre_render_audio_path,
                     model=narration_model,
                     provider=narration_provider,
                     timeout_seconds=narration_tts_timeout_seconds,
                 )
                 timing_plan = build_narration_timing_plan(
-                    narration_text,
+                    resolved_narration_text,
                     total_duration_seconds=pre_render_audio.get("duration_seconds"),
                 )
             timing_path = narration_dir / "timing_plan.json"
@@ -3364,11 +4353,19 @@ def _render_scene_metadata(
             }
         )
 
-    if metadata.get("success") and narration_text:
+    if resolved_narration_text and metadata.get("narration_timing_plan"):
+        timeline_actual = load_narration_timeline_actual(
+            job_dir,
+            metadata.get("narration_timing_plan"),
+        )
+        if timeline_actual:
+            metadata["narration_timeline_actual"] = timeline_actual
+
+    if metadata.get("success") and resolved_narration_text:
         try:
             add_narration_to_render(
                 metadata,
-                narration_text,
+                resolved_narration_text,
                 model=narration_model,
                 provider=narration_provider,
                 tts_timeout_seconds=narration_tts_timeout_seconds,
@@ -3415,6 +4412,34 @@ def plan_narration_timing(
     )
 
 
+@mcp.tool()
+def prepare_narration(
+    narration_text: str,
+    narration_model: str = DEFAULT_NARRATION_MODEL,
+    narration_provider: str = DEFAULT_NARRATION_PROVIDER,
+    narration_tts_timeout_seconds: int = 120,
+    narration_mux_timeout_seconds: int = 300,
+    narration_audio_mode: NarrationAudioMode = "segmented",
+) -> dict[str, Any]:
+    """Prepare narration audio and exact segment timings before writing a scene.
+
+    Use this optional first step for complex narrated videos. It returns a
+    prepared_narration_id, combined audio path, per-sentence durations, and
+    per-segment audio paths. Claude should use those durations to plan a full
+    Manim scene with attractive visuals, then call
+    render_scene_with_prepared_narration. Do not inject audio playback code into
+    Manim; the server will mux and verify the prepared audio after render.
+    """
+    return prepare_narration_metadata(
+        narration_text,
+        narration_model=narration_model,
+        narration_provider=narration_provider,
+        narration_tts_timeout_seconds=narration_tts_timeout_seconds,
+        narration_mux_timeout_seconds=narration_mux_timeout_seconds,
+        narration_audio_mode=narration_audio_mode,
+    )
+
+
 @mcp.prompt(
     name="write_narrated_manim_scene",
     title="Write Narrated Manim Scene",
@@ -3425,19 +4450,23 @@ def write_narrated_manim_scene_prompt(topic: str, quality: str = "low") -> str:
     return f"""
 Create and render a narrated ManimCE scene about: {topic}
 
-Use render_scene_with_narration with quality="{quality}",
-narration_sync_mode="timeline", narration_audio_mode="segmented",
-visual_quality_checks=true, and fail_on_quality_issues=true.
+For complex explanations, call prepare_narration first, use the returned
+durations to plan the scene, then call render_scene_with_prepared_narration.
+For quick/simple explanations, call render_scene_with_narration directly.
+Use quality="{quality}", narration_sync_mode="timeline",
+narration_audio_mode="segmented", visual_quality_checks=true, and
+fail_on_quality_issues=true.
 
 Rules:
 - Use ManimCE normally; the MCP helpers are for timing/framing, not a replacement for Manim.
 - Write narration_text first: 6 to 10 short sentences. Sentence 0 introduces the topic/problem, sentence 1 states the goal, middle sentences explain step by step, final sentence summarizes.
-- In construct(), use tl = narration_timeline(self), then bind each sentence once with tl.play_segment(index, ...) or tl.wait_segment(index). For N sentences, valid indices are 0 through N-1.
-- Keep timed self.play/self.wait calls inside tl segments; use self.add(...) for instant setup.
+- In construct(), use tl = narration_timeline(self), then bind each sentence once with tl.play_segment(index, ...) or tl.wait_segment(index). The visual in segment i must depict narration sentence i; if a sentence names "fuel -> engine -> wheels", reveal that flow in the same segment.
+- Keep timed self.play/self.wait calls inside tl segments; use self.add/self.remove for instant setup/cleanup. Transitions also belong inside the narration segment they support.
 - Use fit_to_safe_frame(group) for wide layouts and keep_in_safe_frame(label) for floating labels/callouts.
+- Make it visually engaging: use tasteful color, depth, motion, highlights, transforms, indications, camera moves, traced paths, graphs, 3D, and layered VGroups when they help. Keep each beat readable: one main idea per narration sentence, then hold on the final frame until the sentence finishes.
 - Avoid common Python mistakes: do not reuse comprehension variables like i or p after a comprehension.
 - Prefer Text unless LaTeX is really needed and tex_ready=true.
-- If rendering fails, fix the reported diagnostic and rerender once. On success, include final_response_markdown verbatim.
+- If the tool returns a render or quality error, fix the reported diagnostic and rerender once. On success, include final_response_markdown verbatim.
 """.strip()
 
 
@@ -3450,6 +4479,7 @@ def render_scene(
     save_last_frame: bool = False,
     timeout_seconds: int = 120,
     narration_text: str | None = None,
+    prepared_narration_id: str | None = None,
     narration_model: str = DEFAULT_NARRATION_MODEL,
     narration_provider: str = DEFAULT_NARRATION_PROVIDER,
     narration_tts_timeout_seconds: int = 120,
@@ -3474,16 +4504,17 @@ def render_scene(
     your MCP client can render those resources usefully.
 
     Args:
-        narration_text: Optional narration to synthesize through Hugging Face
-            Inference API or local Kokoro and mux into the rendered MP4. If
-            HF_TOKEN is available, the hosted API is used. If not, local Kokoro
-            is used and may download public model weights on first run. If the
-            user asks for voice, narration, audio, or a spoken explanation, pass
-            this field or use render_scene_with_narration. Without it, the
-            output video is intentionally silent.
+        narration_text: Optional spoken script to mux into the rendered MP4.
+            If the user asks for voice, narration, audio, or a spoken
+            explanation, pass this field or use render_scene_with_narration.
+            Without it, the output video is intentionally silent.
+        prepared_narration_id: Optional id returned by prepare_narration. Use
+            this instead of narration_text when Claude already has measured
+            segment durations and wants to render with that exact prepared audio.
         narration_sync_mode: `timeline` retimes self.play/self.wait calls to a
-            sentence-level plan before render and then fits residual duration
-            mismatch. `fit` globally retimes the final video to the narration.
+            sentence-level plan before render, measures actual timeline starts
+            during render, and aligns segmented audio to those starts. `fit`
+            globally retimes the final video to the narration.
             `pad` preserves the video speed and pads/freezes only at the end.
         narration_audio_mode: `segmented` synthesizes one audio file per
             narration segment and uses real per-segment durations for tighter
@@ -3505,6 +4536,7 @@ def render_scene(
         save_last_frame=save_last_frame,
         timeout_seconds=timeout_seconds,
         narration_text=narration_text,
+        prepared_narration_id=prepared_narration_id,
         narration_model=narration_model,
         narration_provider=narration_provider,
         narration_tts_timeout_seconds=narration_tts_timeout_seconds,
@@ -3547,18 +4579,18 @@ def render_scene_with_narration(
     max_inline_video_bytes: int = 2_000_000,
     max_inline_ui_video_bytes: int = 0,
 ) -> CallToolResult:
-    """Render a narrated ManimCE MP4 with Hugging Face text-to-speech audio.
+    """Render a narrated ManimCE MP4.
 
     Use this tool, not plain render_scene, whenever the user asks for voice,
     narration, audio, spoken explanation, or a video that explains something out
-    loud. The narration text is required. If HF_TOKEN is available, the server
-    uses hosted Hugging Face TTS. If HF_TOKEN is missing, it uses local Kokoro
-    and may download public model weights on first run. The server muxes audio
-    into the MP4, automatically retimes ordinary self.play/self.wait calls to a
-    sentence-level narration timing plan, globally fits any remaining duration
-    mismatch, and verifies the final MP4 has an audio stream. By default, it
-    synthesizes narration segment by segment so each visual beat can use real
-    measured audio duration instead of heuristic timing.
+    loud. The narration text is required. The server handles audio generation,
+    muxing, measured sentence durations, actual Manim Scene.time tracking, and
+    audio-stream verification. In timeline mode it aligns segmented audio to
+    rendered beat starts instead of globally speeding up or slowing down the
+    video. Your job is to write a Manim scene whose visual beats match the
+    spoken script. For complex videos, prepare_narration followed by
+    render_scene_with_prepared_narration gives Claude exact segment durations
+    before it writes the scene.
 
     For best first-render quality, write narration_text before scene code. The
     first sentence should introduce the topic/problem, the second should state
@@ -3569,29 +4601,37 @@ def render_scene_with_narration(
     Use explicit timeline beats by default: call `tl = narration_timeline(self)`
     near the start of construct(), then bind every narration sentence in order
     with exactly one primary `tl.play_segment(index, ...)` or
-    `tl.wait_segment(index)`. If there are N narration sentences, use only
-    indices 0 through N-1. Avoid timed self.play/self.wait outside the helper
-    except for instant setup via self.add(...). The automatic retimer can count
-    literal range/list loops and simple local list/tuple/set assignments, but
-    complex loops should use explicit segment calls. Do not reuse comprehension
+    `tl.wait_segment(index)`. Segment i should visually depict sentence i. If a
+    sentence says "fuel, engine, transmission, driveshaft, wheels", reveal that
+    exact flow in that same segment; do not play it one sentence earlier or
+    later. If there are N narration sentences, use only indices 0 through N-1.
+    Avoid timed self.play/self.wait outside the helper; use self.add/self.remove
+    for instant setup/cleanup. Short transition pauses are allowed, but
+    important visual motion should happen inside the segment that explains it.
+    The automatic retimer can count literal
+    range/list loops and simple local list/tuple/set assignments, but complex
+    loops should use explicit segment calls. Do not reuse comprehension
     variables such as `i` or `p` after the comprehension ends.
     Do not define custom helpers named `narration_timeline`,
     `NarrationTimeline`, `fit_to_safe_frame`, or `keep_in_safe_frame`; the
     server injects those.
 
-    Pace first drafts generously: one clear motion plus one optional label or
-    callout per narration sentence is usually better than many rapid animations.
+    Make the video attractive enough to hold attention: use tasteful color,
+    depth, smooth transforms, indications, camera moves, updaters, paths,
+    graphs, 3D scenes, and layered groups when they help the explanation. Pace
+    first drafts generously: one clear idea plus one optional label or callout
+    per narration sentence is usually better than many unrelated motions.
     Fade or replace old labels before adding new ones to avoid overlays.
     For frame-safe layouts, group large systems and call fit_to_safe_frame(group)
     before animating them; keep labels within the frame with keep_in_safe_frame.
     By default, severe sync drift or clipped-frame quality checks return a tool
-    error with artifact links so Claude can inspect, revise, and rerender once
-    before responding to the user. If Manim exits with an exception, the tool
-    returns the concise exception line so Claude can fix the scene. If the final
-    render succeeds, do not mention internal sync warnings in the final response.
+    error with artifact links and concrete feedback so Claude can revise and
+    rerender once before responding to the user. If Manim exits with an
+    exception, the tool returns the concise exception line so Claude can fix the
+    scene. If the final render succeeds, do not mention internal sync warnings
+    in the final response.
     After this tool returns, include `final_response_markdown` verbatim in the
     assistant response so the user can open the video from Claude Desktop.
-    HF_TOKEN is optional; without it, local Kokoro TTS is used.
     """
     return render_scene(
         code=code,
@@ -3607,6 +4647,62 @@ def render_scene_with_narration(
         narration_mux_timeout_seconds=narration_mux_timeout_seconds,
         narration_sync_mode=narration_sync_mode,
         narration_audio_mode=narration_audio_mode,
+        visual_quality_checks=visual_quality_checks,
+        fail_on_quality_issues=fail_on_quality_issues,
+        include_resource_links=include_resource_links,
+        include_ui_resource=include_ui_resource,
+        embed_preview_html=embed_preview_html,
+        embed_video_bytes=embed_video_bytes,
+        max_inline_video_bytes=max_inline_video_bytes,
+        max_inline_ui_video_bytes=max_inline_ui_video_bytes,
+    )
+
+
+@mcp.tool()
+def render_scene_with_prepared_narration(
+    code: str,
+    prepared_narration_id: str,
+    scene_name: str | None = None,
+    quality: Quality = "low",
+    timeout_seconds: int = 120,
+    narration_mux_timeout_seconds: int = 300,
+    narration_sync_mode: NarrationSyncMode = "timeline",
+    visual_quality_checks: bool = True,
+    fail_on_quality_issues: bool = True,
+    include_resource_links: bool = True,
+    include_ui_resource: bool = False,
+    embed_preview_html: bool = False,
+    embed_video_bytes: bool = False,
+    max_inline_video_bytes: int = 2_000_000,
+    max_inline_ui_video_bytes: int = 0,
+) -> CallToolResult:
+    """Render a ManimCE MP4 using audio from prepare_narration.
+
+    Use this after prepare_narration for higher-quality narrated videos. Claude
+    should write one complete Manim scene and may use any Manim capability:
+    transforms, updaters, camera movement, 3D scenes, graphs, paths, and rich
+    VGroup compositions are all allowed. The prepared timing plan is guidance
+    for pacing; the server still owns audio muxing, actual render-time sync
+    measurement, and quality feedback.
+
+    In timeline mode, use `tl = narration_timeline(self)` and bind narration
+    sentence i to visual beat i with `tl.play_segment(i, ...)` or
+    `tl.wait_segment(i)`. Make the visuals attractive and viewer-friendly, but
+    keep them readable and inside the frame. On success, include
+    `final_response_markdown` verbatim in the assistant response.
+    """
+    return render_scene(
+        code=code,
+        scene_name=scene_name,
+        quality=quality,
+        output_format="mp4",
+        save_last_frame=False,
+        timeout_seconds=timeout_seconds,
+        narration_text=None,
+        prepared_narration_id=prepared_narration_id,
+        narration_mux_timeout_seconds=narration_mux_timeout_seconds,
+        narration_sync_mode=narration_sync_mode,
+        narration_audio_mode="segmented",
         visual_quality_checks=visual_quality_checks,
         fail_on_quality_issues=fail_on_quality_issues,
         include_resource_links=include_resource_links,

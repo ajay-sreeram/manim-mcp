@@ -8,6 +8,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 renders/
+prepared_narrations/
 dist/
 build/
 *.egg-info/

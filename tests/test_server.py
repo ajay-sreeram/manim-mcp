@@ -472,6 +472,39 @@ class Demo(Scene):
     assert 'return dict(index=index, text="", duration_seconds=0.05, out_of_range=True)' in code
 
 
+def test_prepare_narrated_scene_code_reports_visual_alignment_drift() -> None:
+    _code, report = server.prepare_narrated_scene_code(
+        """
+from manim import *
+
+class Demo(Scene):
+    def construct(self):
+        tl = narration_timeline(self)
+        title = Text("How a car works")
+        tl.play_segment(0, FadeIn(title))
+        parts = VGroup(Text("Fuel"), Text("Engine"), Text("Wheels"))
+        tl.play_segment(1, FadeIn(parts))
+        piston = Text("Engine combustion")
+        tl.play_segment(2, FadeIn(piston))
+""",
+        scene_name="Demo",
+        timing_plan={
+            "segments": [
+                {"text": "A car turns stored energy into motion.", "duration_seconds": 3.0},
+                {"text": "First, we will set up the question.", "duration_seconds": 2.0},
+                {"text": "The flow goes from fuel to engine and finally to wheels.", "duration_seconds": 5.0},
+            ]
+        },
+        sync_mode="timeline",
+    )
+
+    alignment = report["timeline_alignment"]
+    assert alignment["checked"] is True
+    assert alignment["issues"][0]["code"] == "timeline_visual_appears_early"
+    assert alignment["issues"][0]["segment_index"] == 1
+    assert alignment["issues"][0]["next_overlap_terms"] == ["engine", "fuel", "wheel"]
+
+
 def test_narration_timeline_helper_treats_extra_segment_as_short_pause() -> None:
     namespace = {
         "config": type("Config", (), {"frame_width": 14.2, "frame_height": 8.0})(),
@@ -524,6 +557,7 @@ class Demo(Scene):
     assert report["scene_retimed"] is False
     assert report["timed_call_count"] == 1
     assert report["outside_timeline_timed_call_count"] == 1
+    assert report["outside_timeline_estimated_seconds"] == 1.0
     assert code.count("def narration_timeline(scene):") == 1
     assert "def _manim_mcp_user_narration_timeline(scene):" in code
     assert "MANIM_MCP_CALL_DURATIONS = []" in code
@@ -565,6 +599,7 @@ def test_write_narrated_manim_scene_prompt_guides_sync_and_frame_safety() -> Non
     assert "introduces the topic/problem" in prompt
     assert "step by step" in prompt
     assert "Use ManimCE normally" in prompt
+    assert "visual in segment i must depict narration sentence i" in prompt
     assert "Avoid common Python mistakes" in prompt
     assert "fix the reported diagnostic" in prompt
 
@@ -923,6 +958,54 @@ def test_analyze_render_quality_flags_incomplete_timeline_coverage(tmp_path, mon
     assert quality["ok"] is False
     assert quality["issues"][0]["code"] == "incomplete_timeline_coverage"
     assert quality["issues"][0]["missing_segments"] == [2, 3]
+
+
+def test_analyze_render_quality_flags_outside_timeline_timed_calls() -> None:
+    metadata = {
+        "success": True,
+        "narration_requested": True,
+        "narration_sync": {
+            "explicit_timeline_used": True,
+            "outside_timeline_timed_call_count": 3,
+            "outside_timeline_estimated_seconds": 3.0,
+        },
+        "artifacts": [],
+    }
+
+    quality = server.analyze_render_quality(metadata)
+
+    assert quality["ok"] is False
+    assert quality["issues"][0]["code"] == "outside_timeline_timed_calls"
+
+
+def test_analyze_render_quality_flags_timeline_visual_alignment() -> None:
+    metadata = {
+        "success": True,
+        "narration_requested": True,
+        "narration_sync": {
+            "explicit_timeline_used": True,
+            "timeline_alignment": {
+                "issues": [
+                    {
+                        "severity": "error",
+                        "code": "timeline_visual_appears_early",
+                        "segment_index": 1,
+                        "line": 12,
+                        "message": "visual beat is one sentence early",
+                        "visual_terms": ["fuel", "engine"],
+                        "next_overlap_terms": ["fuel", "engine"],
+                    }
+                ]
+            },
+        },
+        "artifacts": [],
+    }
+
+    quality = server.analyze_render_quality(metadata)
+
+    assert quality["ok"] is False
+    assert quality["issues"][0]["code"] == "timeline_visual_appears_early"
+    assert quality["issues"][0]["segment_index"] == 1
 
 
 def test_analyze_render_quality_flags_timeline_duration_mismatch() -> None:
