@@ -45,7 +45,7 @@ Manim CE quick reference (avoid common mistakes):
 - MarkupText("<b>bold</b> and <i>italic</i>")       # Pango markup
 - MathTex(r"e^{i\\pi} + 1 = 0")                       # LaTeX (needs tex_ready)
 - Tex(r"This requires LaTeX")                       # LaTeX
-  -> If check_environment reports tex_ready=false, use Text only.
+  -> Use Text/MarkupText unless the user explicitly needs LaTeX math/typesetting.
 
 # Positioning + layout:
 - thing.next_to(other, RIGHT, buff=0.3)
@@ -153,14 +153,6 @@ WHAT NOT TO DO
 # Tool docstrings (kept here so tools.py stays readable)
 # ---------------------------------------------------------------------------
 
-CHECK_ENVIRONMENT_DOC = """Probe local Manim MCP dependencies without installing anything.
-
-Returns availability + versions for python, manim, ffmpeg, ffprobe, LaTeX,
-and the TTS backends. Call this first whenever you might use Tex/MathTex
-(check ``tex_ready``), or when a render fails with "command not found".
-"""
-
-
 PREPARE_NARRATION_DOC = """Prepare narration audio + per-sentence timings before writing the scene.
 
 Recommended for any non-trivial educational video. Returns a
@@ -184,8 +176,9 @@ When to use which tool:
   - Voice / narrated explanation, single call    -> render_scene_with_narration
   - Voice video with prepared narration + plan   -> render_scene_with_prepared_narration
 
-Media bytes, preview HTML, and ui:// resources are NOT embedded by default
-to keep responses small. The normal response always includes
+Media bytes and preview HTML are NOT embedded by default to keep responses
+small. MCP Apps-capable hosts may render the linked ``ui://`` player from
+tool metadata, and the normal text response always includes
 ``Open video``, ``Open player``, and ``Video path`` lines -- include
 ``final_response_markdown`` verbatim in your reply so the user can open the video.
 
@@ -287,8 +280,8 @@ Recommended workflow:
 - For quick explanations: call `render_scene_with_narration` directly.
 - Defaults: quality="{quality}", narration_sync_mode="timeline",
   narration_audio_mode="segmented", visual_quality_checks=true.
-- If you'll use `Tex` or `MathTex`, call `check_environment` first and
-  confirm `tex_ready=true`. Otherwise stick to `Text` and `MarkupText`.
+- Prefer `Text` and `MarkupText` unless the user explicitly asks for LaTeX
+  math/typesetting. `Tex` and `MathTex` require a working local TeX toolchain.
 
 Aim for a 30 to 90 second video; never exceed 2 minutes.
 """

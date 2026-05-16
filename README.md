@@ -4,9 +4,8 @@ Local MCP server for Claude Desktop that renders Manim Community Edition scenes 
 
 ## What It Provides
 
-- `check_environment`: reports Python, optional `uv`, MCP SDK, Manim, FFmpeg, `pkg-config`, Cairo, LaTeX, and TTS availability. It is a diagnostic tool only; it does not install anything.
 - `render_scene`: renders one Manim scene from complete ManimCE Python code into a per-job folder under `renders/`.
-  Successful renders return compact `Open video`, `Open player`, and `Video path` lines plus metadata. Media bytes and HTML resources are not embedded by default, keeping Claude Desktop tool results small and predictable.
+  Successful renders return compact `Open video`, `Open player`, and `Video path` lines plus metadata. Render tools also advertise a stable MCP Apps `ui://` player for compatible hosts, while media bytes and preview HTML stay out of normal tool results.
   Pass `narration_text` to synthesize narration with hosted Hugging Face TTS or local Kokoro, save it as audio, and mux it into the rendered MP4.
 - `render_scene_with_narration`: same renderer, but with required `narration_text`. Use this when you ask Claude for voice, narration, audio, or a spoken explanation. By default it generates one audio file per narration segment, measures each segment's real duration, records actual Manim `Scene.time` starts during render, aligns audio to those rendered beats, and verifies that the final MP4 has an audio stream. If `HF_TOKEN` is available, narration uses the hosted Hugging Face Inference API; otherwise it falls back to local Kokoro.
 - `prepare_narration`: optional first step for complex narrated videos. It generates narration audio, returns exact segment durations plus compact relative audio paths such as `narration/segments/000.wav`, and gives Claude a `prepared_narration_id` to use while planning a full Manim scene.
@@ -158,15 +157,9 @@ uv run manim-mcp-install-claude --source
 
 ## Native Dependencies
 
-This project does not install system packages automatically. On macOS, Manim needs native tools such as Cairo, `pkg-config`, Pango, and FFmpeg for video output. Narration sync also needs `ffprobe` so the server can measure video/audio duration before muxing. LaTeX plus `dvisvgm` is optional unless scenes use `Tex` or `MathTex`.
+The install flow should provision or validate the runtime pieces this server needs. On macOS, Manim needs native tools such as Cairo, `pkg-config`, Pango, and FFmpeg for video output. Narration sync also needs `ffprobe` so the server can measure video/audio duration before muxing. LaTeX plus `dvisvgm` is optional unless scenes use `Tex` or `MathTex`.
 
-The MCP server automatically prepends project-local TeX paths such as `.tinytex/bin/*` and `.texenv/bin` when checking tools and rendering scenes, so Claude Desktop does not need global TeX symlinks.
-
-Run `check_environment` from Claude Desktop or:
-
-```bash
-uv run python -c "from manim_mcp.server import check_environment; import json; print(json.dumps(check_environment(), indent=2))"
-```
+The MCP server automatically prepends project-local TeX paths such as `.tinytex/bin/*` and `.texenv/bin` when rendering scenes, so Claude Desktop does not need global TeX symlinks.
 
 ## Package And Release
 
@@ -208,7 +201,7 @@ Use prepare_narration first so you know exact sentence durations, then storyboar
 
 For more complex narrated scenes, use the MCP prompt `write_narrated_manim_scene`. It tells Claude to write the narration first, introduce the topic/problem before solving, storyboard readable visual beats, bind each sentence to `tl.play_segment(...)` or `tl.wait_segment(...)`, clear old groups between subtopics, and use `fit_to_safe_frame(...)` for large layouts.
 
-Claude Desktop currently surfaces the returned links more reliably than inline MCP UI resources. By default this server does not embed `ui://` HTML or media bytes. It still creates a small local player page for the `Open player` link, but it does not show a separate redundant `preview.html` link in normal responses.
+MCP Apps-capable clients can render the inline `ui://manim-mcp/render-player.html` player from the render tool metadata, following the same tool/resource pattern used by the official MCP Apps Python examples. The inline player reads the rendered artifact through a `manim-render://<job_id>/artifact` MCP resource, with localhost links kept only as fallback access lines.
 
 Every successful render now includes these visible access lines in the text result:
 
@@ -218,6 +211,6 @@ Every successful render now includes these visible access lines in the text resu
 
 The result metadata also includes `final_response_markdown` and `claude_response_instructions`. Claude should paste `final_response_markdown` into its chat response. If it forgets, ask Claude to call `get_render_access` with `job_id="latest"`.
 
-By default, video bytes are not base64-embedded in tool responses because Claude Desktop rejects tool results larger than 1MB. For compatible MCP clients, you can opt in to `ui://` HTML resources with `include_ui_resource=true`, but local video/player links are the safer default.
+By default, video bytes are not base64-embedded in tool responses because Claude Desktop rejects tool results larger than 1MB. For older compatible MCP clients that expect an embedded resource in the tool result, you can still opt in with `include_ui_resource=true`; the registered MCP Apps player is the default inline path.
 
 If a rendered MP4 is silent, check its `metadata.json`. `narration_requested: false` means Claude called the plain render tool without narration text. Use `render_scene_with_narration` or explicitly pass `narration_text`. `narration_tts_backend` shows whether a render used `huggingface-api` or `local-kokoro`.

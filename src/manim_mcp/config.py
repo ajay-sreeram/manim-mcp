@@ -5,12 +5,9 @@ Kept intentionally small so every other module can import it without cycles.
 
 from __future__ import annotations
 
-import importlib.metadata
 import os
 import re
 import secrets
-import shutil
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -316,51 +313,6 @@ def env_value(name: str) -> str | None:
         parsed = raw_value.strip().strip('"').strip("'")
         return parsed or None
     return None
-
-
-# ---------------------------------------------------------------------------
-# External tool probing (used by check_environment)
-# ---------------------------------------------------------------------------
-
-def version_for_distribution(name: str) -> str | None:
-    try:
-        return importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
-        return None
-
-
-def run_probe(command: list[str], timeout: int = 5) -> dict[str, Any]:
-    env = tool_env()
-    executable = shutil.which(command[0], path=env.get("PATH"))
-    if not executable and not Path(command[0]).exists():
-        return {"available": False, "command": command, "path": None}
-
-    full_command = [str(Path(command[0])) if Path(command[0]).exists() else executable, *command[1:]]
-    try:
-        completed = subprocess.run(
-            full_command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            shell=False,
-            env=env,
-        )
-    except Exception as exc:
-        return {
-            "available": False,
-            "command": command,
-            "path": full_command[0],
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-    output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part)
-    return {
-        "available": completed.returncode == 0,
-        "command": command,
-        "path": full_command[0],
-        "returncode": completed.returncode,
-        "output": output[:2000],
-    }
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,11 @@ from mcp.types import (
     TextResourceContents,
 )
 
+from .app_ui import (
+    MANIM_RENDER_APP_MIME_TYPE,
+    manim_render_artifact_uri,
+    manim_render_resource_meta,
+)
 from .config import (
     ALLOWED_FORMATS,
     ASSET_ROUTE_PREFIX,
@@ -298,6 +303,7 @@ class _RenderAssetHandler(BaseHTTPRequestHandler):
         content_length = max(0, end - start + 1) if file_size else 0
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(content_length))
         self.send_header("Cache-Control", "no-store")
@@ -509,12 +515,15 @@ def update_access_metadata(
     if primary:
         video_path = Path(primary["path"])
         stream_url = render_asset_url(video_path)
+        job_id = metadata.get("job_id")
         access.update({
             "video_path": str(video_path.resolve()),
             "video_file_uri": primary["uri"],
             "video_mime_type": primary.get("mime_type", "application/octet-stream"),
             "video_size_bytes": primary.get("size_bytes"),
         })
+        if isinstance(job_id, str) and job_id:
+            access["video_resource_uri"] = manim_render_artifact_uri(job_id)
         if stream_url:
             access["video_stream_url"] = stream_url
 
@@ -647,7 +656,7 @@ def create_ui_preview_resource(
 """
     metadata["ui_preview"] = {
         "uri": ui_uri,
-        "mime_type": "text/html;profile=mcp-app",
+        "mime_type": MANIM_RENDER_APP_MIME_TYPE,
         "inline_media": used_inline_media,
         "inline_limit_bytes": max_inline_video_bytes,
         "media_uri": "inline" if used_inline_media else linked_media_uri,
@@ -657,7 +666,8 @@ def create_ui_preview_resource(
         type="resource",
         resource=TextResourceContents(
             uri=ui_uri,
-            mimeType="text/html;profile=mcp-app",
+            mimeType=MANIM_RENDER_APP_MIME_TYPE,
+            _meta=manim_render_resource_meta(),
             text=ui_html,
         ),
     )
@@ -853,8 +863,6 @@ def latest_render_job_dir() -> Path | None:
     return max(job_dirs, key=lambda item: item.stat().st_mtime)
 
 
-# Re-exported for the public `check_environment` tool so it can probe Manim
-# without importing all of subprocess/sys here twice.
 def python_executable_path() -> str:
     return sys.executable
 

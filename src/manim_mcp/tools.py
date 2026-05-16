@@ -14,6 +14,15 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, ResourceLink, TextContent
 
+from .app_ui import (
+    MANIM_RENDER_ARTIFACT_MIME_TYPE,
+    MANIM_RENDER_ARTIFACT_URI_TEMPLATE,
+    MANIM_RENDER_APP_MIME_TYPE,
+    MANIM_RENDER_APP_URI,
+    manim_render_app_resource,
+    manim_render_resource_meta,
+    manim_render_tool_meta,
+)
 from .config import (
     DEFAULT_NARRATION_MODEL,
     DEFAULT_NARRATION_PROVIDER,
@@ -23,13 +32,9 @@ from .config import (
     NarrationSyncMode,
     OutputFormat,
     Quality,
-    env_value,
-    run_probe,
-    version_for_distribution,
 )
 from .narration import prepare_narration_metadata
 from .prompts import (
-    CHECK_ENVIRONMENT_DOC,
     GET_RENDER_ACCESS_DOC,
     LIST_RENDERS_DOC,
     PREPARE_NARRATION_DOC,
@@ -53,93 +58,7 @@ from .render_pipeline import render_scene_metadata
 
 
 # ---------------------------------------------------------------------------
-# 1. check_environment
-# ---------------------------------------------------------------------------
-
-def check_environment() -> dict[str, Any]:
-    import sys
-
-    checks: dict[str, Any] = {
-        "python": {
-            "available": True,
-            "executable": sys.executable,
-            "version": sys.version.split()[0],
-        },
-        "uv": run_probe(["uv", "--version"]),
-        "mcp_sdk": {
-            "available": version_for_distribution("mcp") is not None,
-            "version": version_for_distribution("mcp"),
-        },
-        "huggingface_hub": {
-            "available": version_for_distribution("huggingface-hub") is not None,
-            "version": version_for_distribution("huggingface-hub"),
-        },
-        "kokoro": {
-            "available": version_for_distribution("kokoro") is not None,
-            "version": version_for_distribution("kokoro"),
-        },
-        "soundfile": {
-            "available": version_for_distribution("soundfile") is not None,
-            "version": version_for_distribution("soundfile"),
-        },
-        "espeakng_loader": {
-            "available": version_for_distribution("espeakng-loader") is not None,
-            "version": version_for_distribution("espeakng-loader"),
-        },
-        "espeak_ng": run_probe(["espeak-ng", "--version"]),
-        "hf_token": {
-            "available": bool(env_value("HF_TOKEN")),
-            "env_var": "HF_TOKEN",
-            "source": "environment or project .env",
-        },
-        "manim_package": {
-            "available": version_for_distribution("manim") is not None,
-            "version": version_for_distribution("manim"),
-        },
-        "manim_cli": run_probe([sys.executable, "-m", "manim", "--version"], timeout=30),
-        "ffmpeg": run_probe(["ffmpeg", "-version"]),
-        "ffprobe": run_probe(["ffprobe", "-version"]),
-        "pkg_config": run_probe(["pkg-config", "--version"]),
-        "cairo_pkg_config": run_probe(["pkg-config", "--exists", "cairo"]),
-        "latex": run_probe(["latex", "--version"]),
-        "pdflatex": run_probe(["pdflatex", "--version"]),
-        "dvisvgm": run_probe(["dvisvgm", "--version"]),
-    }
-    required = ["python", "mcp_sdk", "manim_package", "manim_cli"]
-    recommended = ["ffmpeg", "ffprobe", "pkg_config", "cairo_pkg_config"]
-    missing_required = [name for name in required if not checks[name].get("available")]
-    missing_recommended = [name for name in recommended if not checks[name].get("available")]
-    notes = []
-    if not checks["uv"].get("available"):
-        notes.append("uv is optional for installed packages, but useful for source checkout workflows.")
-    if missing_recommended:
-        notes.append("Missing native tools may prevent Manim install or video rendering on macOS.")
-    if not checks["ffprobe"].get("available"):
-        notes.append("ffprobe is required for reliable narration/video duration sync.")
-    tex_compiler_available = checks["latex"].get("available") or checks["pdflatex"].get("available")
-    tex_ready = tex_compiler_available and checks["dvisvgm"].get("available")
-    if not tex_ready:
-        notes.append("LaTeX and dvisvgm are optional unless scenes use Tex or MathTex.")
-    if not checks["hf_token"].get("available"):
-        if checks["kokoro"].get("available") and checks["soundfile"].get("available"):
-            notes.append("HF_TOKEN is not set; narrated renders will use local Kokoro TTS.")
-        else:
-            notes.append("HF_TOKEN is not set and local Kokoro TTS packages are missing.")
-    return {
-        "ok": not missing_required,
-        "missing_required": missing_required,
-        "missing_recommended": missing_recommended,
-        "tex_ready": tex_ready,
-        "checks": checks,
-        "notes": notes,
-    }
-
-
-check_environment.__doc__ = CHECK_ENVIRONMENT_DOC
-
-
-# ---------------------------------------------------------------------------
-# 2. prepare_narration
+# 1. prepare_narration
 # ---------------------------------------------------------------------------
 
 def prepare_narration(
@@ -164,7 +83,7 @@ prepare_narration.__doc__ = PREPARE_NARRATION_DOC
 
 
 # ---------------------------------------------------------------------------
-# 3. render_scene (silent or narrated)
+# 2. render_scene (silent or narrated)
 # ---------------------------------------------------------------------------
 
 def render_scene(
@@ -224,7 +143,7 @@ render_scene.__doc__ = RENDER_SCENE_DOC
 
 
 # ---------------------------------------------------------------------------
-# 4. render_scene_with_narration
+# 3. render_scene_with_narration
 # ---------------------------------------------------------------------------
 
 def render_scene_with_narration(
@@ -277,7 +196,7 @@ render_scene_with_narration.__doc__ = RENDER_SCENE_WITH_NARRATION_DOC
 
 
 # ---------------------------------------------------------------------------
-# 5. render_scene_with_prepared_narration
+# 4. render_scene_with_prepared_narration
 # ---------------------------------------------------------------------------
 
 def render_scene_with_prepared_narration(
@@ -324,7 +243,7 @@ render_scene_with_prepared_narration.__doc__ = RENDER_SCENE_WITH_PREPARED_NARRAT
 
 
 # ---------------------------------------------------------------------------
-# 6. get_render_access (recover links for an existing job)
+# 5. get_render_access (recover links for an existing job)
 # ---------------------------------------------------------------------------
 
 def _job_dir_for(job_id: str) -> Path:
@@ -335,6 +254,35 @@ def _job_dir_for(job_id: str) -> Path:
     if render_root not in job_dir.parents and job_dir != render_root:
         raise ValueError("Invalid job_id path.")
     return job_dir
+
+
+def render_artifact_resource(job_id: str) -> bytes:
+    """Return the primary render artifact bytes for MCP Apps inline playback."""
+    job_dir = _job_dir_for(job_id)
+    metadata_path = job_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise ValueError(f"Render job '{job_id}' has no metadata.json.")
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"metadata.json is invalid JSON: {exc}") from exc
+
+    artifacts = metadata.get("artifacts") or []
+    if not artifacts and (job_dir / "media").exists():
+        artifacts = discover_artifacts(job_dir / "media")
+
+    primary = primary_video_artifact(artifacts) or (artifacts[0] if artifacts else None)
+    if not primary:
+        raise ValueError(f"No render artifact was found for job '{job_id}'.")
+
+    artifact_path = Path(primary["path"]).resolve()
+    render_root = RENDER_ROOT.resolve()
+    if artifact_path != render_root and render_root not in artifact_path.parents:
+        raise ValueError("Render artifact is outside render root.")
+    if not artifact_path.is_file():
+        raise ValueError(f"Render artifact no longer exists: {artifact_path}")
+    return artifact_path.read_bytes()
 
 
 def get_render_access(job_id: str = "latest") -> CallToolResult:
@@ -438,7 +386,7 @@ get_render_access.__doc__ = GET_RENDER_ACCESS_DOC
 
 
 # ---------------------------------------------------------------------------
-# 7. list_renders
+# 6. list_renders
 # ---------------------------------------------------------------------------
 
 def list_renders(limit: int = 20) -> dict[str, Any]:
@@ -468,7 +416,7 @@ list_renders.__doc__ = LIST_RENDERS_DOC
 
 
 # ---------------------------------------------------------------------------
-# 8. read_render_log
+# 7. read_render_log
 # ---------------------------------------------------------------------------
 
 def read_render_log(job_id: str, max_chars: int = 8000) -> dict[str, Any]:
@@ -505,7 +453,7 @@ read_render_log.__doc__ = READ_RENDER_LOG_DOC
 
 
 # ---------------------------------------------------------------------------
-# 9. Prompt template
+# 8. Prompt template
 # ---------------------------------------------------------------------------
 
 def write_narrated_manim_scene_prompt(topic: str, quality: str = "low") -> str:
@@ -519,12 +467,27 @@ def write_narrated_manim_scene_prompt(topic: str, quality: str = "low") -> str:
 
 def register_tools(mcp: FastMCP) -> None:
     """Attach every tool + prompt to the given FastMCP instance."""
-    mcp.tool()(check_environment)
+    mcp.resource(
+        MANIM_RENDER_APP_URI,
+        name="manim_render_player",
+        title="Manim Render Player",
+        description="Inline video player for Manim render results.",
+        mime_type=MANIM_RENDER_APP_MIME_TYPE,
+        meta=manim_render_resource_meta(),
+    )(manim_render_app_resource)
+    mcp.resource(
+        MANIM_RENDER_ARTIFACT_URI_TEMPLATE,
+        name="manim_render_artifact",
+        title="Manim Render Artifact",
+        description="Primary render artifact bytes for MCP Apps inline playback.",
+        mime_type=MANIM_RENDER_ARTIFACT_MIME_TYPE,
+    )(render_artifact_resource)
+
     mcp.tool()(prepare_narration)
-    mcp.tool()(render_scene)
-    mcp.tool()(render_scene_with_narration)
-    mcp.tool()(render_scene_with_prepared_narration)
-    mcp.tool()(get_render_access)
+    mcp.tool(meta=manim_render_tool_meta())(render_scene)
+    mcp.tool(meta=manim_render_tool_meta())(render_scene_with_narration)
+    mcp.tool(meta=manim_render_tool_meta())(render_scene_with_prepared_narration)
+    mcp.tool(meta=manim_render_tool_meta())(get_render_access)
     mcp.tool()(list_renders)
     mcp.tool()(read_render_log)
 
